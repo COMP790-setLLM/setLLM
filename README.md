@@ -67,6 +67,36 @@ python reproduce_setllm.py \
   --fp32-eval
 ```
 
+To run a true vanilla baseline without SetPE/SetMask, use:
+
+```bash
+source .venv/bin/activate
+python reproduce_setllm.py \
+  --architecture vanilla \
+  --model google/gemma-2b \
+  --task arc \
+  --output-dir artifacts/gemma-2b-arc-vanilla \
+  --do-train \
+  --do-eval \
+  --bf16 \
+  --fp32-eval
+```
+
+## ARC Comparison Notes
+
+On one remote reproduction run with `google/gemma-2b` on ARC-Challenge, using
+LoRA finetuning for 3 epoch-sized validation checkpoints over the script's ARC
+validation split (`299` examples), we observed:
+
+| Model | Epoch 1 Random | Epoch 1 Adversarial | Epoch 2 Random | Epoch 2 Adversarial | Epoch 3 Random | Epoch 3 Adversarial |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Set-LLM (`--architecture setllm`) | 0.4615 | 0.4615 | 0.5452 | 0.5452 | 0.5920 | 0.5920 |
+| Vanilla (`--architecture vanilla`) | 0.4694 | 0.1672 | 0.5226 | 0.1505 | 0.5813 | 0.2977 |
+
+The main pattern from this run is that vanilla finetuning improves random-order
+accuracy, but Set-LLM maintains much stronger adversarial-order accuracy across
+all three epochs while ending slightly ahead on random-order accuracy by epoch 3.
+
 ## Optional Extra Pretraining
 
 The paper uses a cleaned UltraFeedback subset, but that preprocessing artifact is

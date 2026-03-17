@@ -16,18 +16,20 @@ paper allows from its text alone.
 from __future__ import annotations
 
 import argparse
+import gc
 import itertools
 import json
 import math
 import os
 import random
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Sequence
 
 import torch
 from datasets import Dataset, load_dataset
-from peft import LoraConfig, get_peft_model
+from peft import LoraConfig, PeftModel, get_peft_model
 from torch import nn
 from torch.utils.data import DataLoader
 from transformers import AutoModelForCausalLM, AutoTokenizer, get_linear_schedule_with_warmup
@@ -68,6 +70,12 @@ def parse_args() -> argparse.Namespace:
         choices=["piqa", "arc", "csqa", "siqa"],
         required=True,
         help="Benchmark to finetune/evaluate.",
+    )
+    parser.add_argument(
+        "--architecture",
+        choices=["setllm", "vanilla"],
+        default="setllm",
+        help="Use Set-LLM masking/positions or the base model's native causal attention path.",
     )
     parser.add_argument(
         "--output-dir",
@@ -188,6 +196,42 @@ def build_setpe_prompt_tokens(
     return input_ids, position_ids, set_ids, seq_ids
 
 
+def build_vanilla_prompt_tokens(
+    tokenizer: AutoTokenizer,
+    mixed_prompt: MixedPrompt,
+    *,
+    add_bos: bool,
+) -> tuple[list[int], list[int], list[int], list[int]]:
+    input_ids: list[int] = []
+
+    if add_bos and tokenizer.bos_token_id is not None:
+        input_ids.append(tokenizer.bos_token_id)
+
+    for part in mixed_prompt:
+        if isinstance(part, TextSpan):
+            input_ids.extend(tokenize_text(tokenizer, part.text))
+            continue
+        for element_text in part.elements:
+            input_ids.extend(tokenize_text(tokenizer, element_text))
+
+    position_ids = list(range(len(input_ids)))
+    set_ids = [-1] * len(input_ids)
+    seq_ids = [-1] * len(input_ids)
+    return input_ids, position_ids, set_ids, seq_ids
+
+
+def build_prompt_tokens(
+    tokenizer: AutoTokenizer,
+    mixed_prompt: MixedPrompt,
+    *,
+    add_bos: bool,
+    architecture: str,
+) -> tuple[list[int], list[int], list[int], list[int]]:
+    if architecture == "vanilla":
+        return build_vanilla_prompt_tokens(tokenizer, mixed_prompt, add_bos=add_bos)
+    return build_setpe_prompt_tokens(tokenizer, mixed_prompt, add_bos=add_bos)
+
+
 def append_response_tokens(
     tokenizer: AutoTokenizer,
     *,
@@ -249,6 +293,7 @@ def batch_to_model_inputs(
     tokenizer: AutoTokenizer,
     device: torch.device,
     dtype: torch.dtype,
+    architecture: str,
 ) -> dict[str, torch.Tensor]:
     pad_id = tokenizer.pad_token_id
     max_len = max(len(item.input_ids) for item in batch)
@@ -265,25 +310,33 @@ def batch_to_model_inputs(
         padded_input_ids = item.input_ids + [pad_id] * pad_len
         padded_labels = item.labels + [IGNORE_INDEX] * pad_len
         padded_positions = item.position_ids + [0] * pad_len
-        pattern = build_attention_pattern(item.prompt_length, length, item.set_ids, item.seq_ids)
-        if pad_len:
-            padded_pattern = torch.zeros((max_len, max_len), dtype=torch.bool)
-            padded_pattern[:length, :length] = pattern
-            pattern = padded_pattern
-        additive_mask = torch.full((max_len, max_len), min_value, dtype=dtype)
-        additive_mask[pattern] = 0
+        if architecture == "vanilla":
+            attention_mask = [1] * length + [0] * pad_len
+            attention_masks.append(attention_mask)
+        else:
+            pattern = build_attention_pattern(item.prompt_length, length, item.set_ids, item.seq_ids)
+            if pad_len:
+                padded_pattern = torch.zeros((max_len, max_len), dtype=torch.bool)
+                padded_pattern[:length, :length] = pattern
+                pattern = padded_pattern
+            additive_mask = torch.full((max_len, max_len), min_value, dtype=dtype)
+            additive_mask[pattern] = 0
+            attention_masks.append(additive_mask)
 
         input_ids.append(padded_input_ids)
         labels.append(padded_labels)
         position_ids.append(padded_positions)
-        attention_masks.append(additive_mask)
 
-    return {
+    model_inputs = {
         "input_ids": torch.tensor(input_ids, dtype=torch.long, device=device),
         "labels": torch.tensor(labels, dtype=torch.long, device=device),
         "position_ids": torch.tensor(position_ids, dtype=torch.long, device=device),
-        "attention_mask": torch.stack(attention_masks, dim=0).unsqueeze(1).to(device),
     }
+    if architecture == "vanilla":
+        model_inputs["attention_mask"] = torch.tensor(attention_masks, dtype=torch.long, device=device)
+    else:
+        model_inputs["attention_mask"] = torch.stack(attention_masks, dim=0).unsqueeze(1).to(device)
+    return model_inputs
 
 
 def prompt_for_piqa(example: dict, permutation: Sequence[str] | None = None) -> tuple[MixedPrompt, str, list[str]]:
@@ -366,13 +419,15 @@ def encode_benchmark_example(
     tokenizer: AutoTokenizer,
     task: str,
     example: dict,
+    architecture: str,
 ) -> EncodedExample:
     prompt_builder = PROMPT_BUILDERS[task]
     prompt, answer, ordered_choices = prompt_builder(example)
-    prompt_ids, prompt_positions, prompt_set_ids, prompt_seq_ids = build_setpe_prompt_tokens(
+    prompt_ids, prompt_positions, prompt_set_ids, prompt_seq_ids = build_prompt_tokens(
         tokenizer,
         prompt,
         add_bos=True,
+        architecture=architecture,
     )
     encoded = append_response_tokens(
         tokenizer,
@@ -395,12 +450,14 @@ def encode_instruction_example(
     tokenizer: AutoTokenizer,
     instruction: str,
     answer: str,
+    architecture: str,
 ) -> EncodedExample:
     prompt = [TextSpan(f"Question: {instruction.strip()}\n\nAnswer:\n")]
-    prompt_ids, prompt_positions, prompt_set_ids, prompt_seq_ids = build_setpe_prompt_tokens(
+    prompt_ids, prompt_positions, prompt_set_ids, prompt_seq_ids = build_prompt_tokens(
         tokenizer,
         prompt,
         add_bos=True,
+        architecture=architecture,
     )
     encoded = append_response_tokens(
         tokenizer,
@@ -538,6 +595,7 @@ def run_training_epoch(
     tokenizer: AutoTokenizer,
     device: torch.device,
     dtype: torch.dtype,
+    architecture: str,
     dataloader: DataLoader,
     optimizer: torch.optim.Optimizer,
     scheduler,
@@ -550,7 +608,7 @@ def run_training_epoch(
     running_loss = 0.0
 
     for step, batch in enumerate(dataloader, start=1):
-        model_inputs = batch_to_model_inputs(batch, tokenizer, device, dtype)
+        model_inputs = batch_to_model_inputs(batch, tokenizer, device, dtype, architecture)
         outputs = model(**model_inputs)
         loss = outputs.loss / gradient_accumulation_steps
         loss.backward()
@@ -585,7 +643,7 @@ def train_stage(
     dtype = get_dtype(args, train=True)
     encoded = [encode_fn(row) for row in dataset]
     dataloader = DataLoader(encoded, batch_size=args.batch_size, shuffle=True, collate_fn=lambda rows: rows)
-    model.to(device)
+    model.to(device=device, dtype=dtype)
 
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(trainable_params, lr=args.learning_rate, weight_decay=args.weight_decay)
@@ -605,6 +663,7 @@ def train_stage(
             tokenizer=tokenizer,
             device=device,
             dtype=dtype,
+            architecture=args.architecture,
             dataloader=dataloader,
             optimizer=optimizer,
             scheduler=scheduler,
@@ -629,12 +688,13 @@ def train_stage(
             and (global_step // args.eval_every) > (last_eval_step // args.eval_every)
         )
         if should_eval:
-            metrics = evaluate(
-                model=model,
+            metrics = evaluate_with_separate_model(
+                training_model=model,
                 tokenizer=tokenizer,
                 dataset=eval_dataset,
                 task=eval_task,
                 args=args,
+                output_dir=output_dir,
             )
             print(
                 f"[{stage_name}] validation step={global_step} "
@@ -668,13 +728,15 @@ def score_candidate_answer(
     tokenizer: AutoTokenizer,
     device: torch.device,
     dtype: torch.dtype,
+    architecture: str,
     prompt: MixedPrompt,
     candidate_answer: str,
 ) -> float:
-    prompt_ids, prompt_positions, prompt_set_ids, prompt_seq_ids = build_setpe_prompt_tokens(
+    prompt_ids, prompt_positions, prompt_set_ids, prompt_seq_ids = build_prompt_tokens(
         tokenizer,
         prompt,
         add_bos=True,
+        architecture=architecture,
     )
     encoded = append_response_tokens(
         tokenizer,
@@ -685,7 +747,7 @@ def score_candidate_answer(
         response_text=candidate_answer,
         add_eos=True,
     )
-    model_inputs = batch_to_model_inputs([encoded], tokenizer, device, dtype)
+    model_inputs = batch_to_model_inputs([encoded], tokenizer, device, dtype, architecture)
     outputs = model(**model_inputs)
     logits = outputs.logits[:, :-1, :]
     labels = model_inputs["labels"][:, 1:]
@@ -701,6 +763,7 @@ def classify_example(
     tokenizer: AutoTokenizer,
     device: torch.device,
     dtype: torch.dtype,
+    architecture: str,
     task: str,
     example: dict,
     permutation: Sequence[str],
@@ -710,7 +773,7 @@ def classify_example(
     best_choice = None
     best_score = None
     for choice in ordered_choices:
-        score = score_candidate_answer(model, tokenizer, device, dtype, prompt, choice)
+        score = score_candidate_answer(model, tokenizer, device, dtype, architecture, prompt, choice)
         if best_score is None or score > best_score:
             best_score = score
             best_choice = choice
@@ -755,7 +818,7 @@ def evaluate(
         predictions = []
         gold = gold_answer(task, row)
         for perm in perms:
-            pred = classify_example(model, tokenizer, device, dtype, task, row, perm)
+            pred = classify_example(model, tokenizer, device, dtype, args.architecture, task, row, perm)
             predictions.append(pred == gold)
 
         random_hits += sum(predictions) / len(predictions)
@@ -767,6 +830,44 @@ def evaluate(
         "adversarial_order_accuracy": adversarial_hits / total,
         "num_examples": total,
     }
+
+
+def evaluate_with_separate_model(
+    *,
+    training_model: nn.Module,
+    tokenizer: AutoTokenizer,
+    dataset: Dataset,
+    task: str,
+    args: argparse.Namespace,
+    output_dir: Path,
+) -> dict[str, float]:
+    if not args.do_train:
+        return evaluate(
+            model=training_model,
+            tokenizer=tokenizer,
+            dataset=dataset,
+            task=task,
+            args=args,
+        )
+
+    with tempfile.TemporaryDirectory(prefix="eval-adapter-", dir=output_dir) as tmpdir:
+        adapter_dir = Path(tmpdir)
+        training_model.save_pretrained(adapter_dir)
+        eval_model, eval_tokenizer = load_model_and_tokenizer(args, train=False)
+        eval_model = PeftModel.from_pretrained(eval_model, adapter_dir, is_trainable=False)
+        eval_model.config.use_cache = False
+        metrics = evaluate(
+            model=eval_model,
+            tokenizer=eval_tokenizer,
+            dataset=dataset,
+            task=task,
+            args=args,
+        )
+        del eval_model
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        return metrics
 
 
 def main() -> None:
@@ -789,7 +890,12 @@ def main() -> None:
                 model=model,
                 tokenizer=tokenizer,
                 dataset=ultra_ds,
-                encode_fn=lambda row: encode_instruction_example(tokenizer, row["instruction"], row["answer"]),
+                encode_fn=lambda row: encode_instruction_example(
+                    tokenizer,
+                    row["instruction"],
+                    row["answer"],
+                    args.architecture,
+                ),
                 args=args,
                 stage_name="ultra-pretrain",
                 output_dir=output_dir,
@@ -801,7 +907,7 @@ def main() -> None:
                 model=model,
                 tokenizer=tokenizer,
                 dataset=train_ds,
-                encode_fn=lambda row: encode_benchmark_example(tokenizer, args.task, row),
+                encode_fn=lambda row: encode_benchmark_example(tokenizer, args.task, row, args.architecture),
                 args=args,
                 stage_name=f"{args.task}-finetune",
                 output_dir=output_dir,
@@ -811,12 +917,13 @@ def main() -> None:
             )
 
         if args.do_eval:
-            metrics = evaluate(
-                model=model,
+            metrics = evaluate_with_separate_model(
+                training_model=model,
                 tokenizer=tokenizer,
                 dataset=eval_ds,
                 task=args.task,
                 args=args,
+                output_dir=output_dir,
             )
             metrics_path = output_dir / f"{args.task}-metrics.json"
             metrics_path.write_text(json.dumps(metrics, indent=2) + "\n")
