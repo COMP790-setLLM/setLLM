@@ -19,27 +19,19 @@ python -m pip install -U pip
 python -m pip install torch transformers datasets peft accelerate sentencepiece
 ```
 
-## Container Image For Runpod
+## Vast.ai Notes
 
-Build a reusable image once, then use it in a custom Runpod template so Pod restarts do not reinstall dependencies.
+For remote GPU runs on Vast.ai:
 
-```bash
-podman build -t ghcr.io/YOUR_GH_USER/setllm:latest .
-podman push ghcr.io/YOUR_GH_USER/setllm:latest
-```
-
-Recommended Runpod setup:
-
-- Use this image in a custom Pod template.
 - Mount persistent storage at `/workspace`.
 - Keep outputs under `/workspace/artifacts`.
 - Set `HF_HOME=/workspace/.cache/huggingface` so model downloads persist.
-- Prefer passing `WANDB_API_KEY` as an environment variable in Runpod instead of storing it in the repo.
+- Prefer passing `WANDB_API_KEY` and `HF_TOKEN` as environment variables on the instance instead of storing them in the repo.
 
-Example run command inside Runpod:
+Example run command inside a Vast.ai instance:
 
 ```bash
-python /app/reproduce_setllm.py \
+python /root/setLLM/reproduce_setllm.py \
   --model google/gemma-2b \
   --task arc \
   --output-dir /workspace/artifacts/gemma-2b-arc \
