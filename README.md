@@ -136,6 +136,57 @@ In other words, `setcausal` is the proposed long-response variant:
 - tokens in one candidate response cannot attend to tokens in another candidate response
 - non-set scaffold text is causal too; it is not fully visible prompt context
 
+### Why `SetMask` Still Matters At Inference
+
+The next generated token is the only token sampled at each decode step, but its
+logits are computed from prompt and prefix hidden states that were already built
+using the prompt-side mask. That means the prompt mask still matters at
+inference time:
+
+- with paper-style `SetMask`, tokens from different set elements do not mix into
+  each other's hidden states on the prompt side
+- with only `SetPE`, element-internal order is preserved, but different set
+  elements can still contaminate each other through fully connected prompt
+  attention
+- the generated response token then reads those hidden states, so any prompt-side
+  leakage is already baked into the context seen at decode time
+
+This is the same structural reason causal masking matters at inference in a
+decoder-only LM: the mask shapes the hidden states that generation consumes, not
+just the tokens that are sampled.
+
+### `setcausal` vs Paper `SetMask`
+
+`setcausal` is a deliberate ablation, not an implementation of the paper's
+original mask.
+
+- `setllm` keeps prompt tokens bidirectional within an allowed region, then
+  blocks attention across different set elements
+- `setcausal` keeps decoder-style causal attention within each element and also
+  blocks cross-element attention
+
+Why test `setcausal` at all:
+
+- Gemma 2B is a decoder-only model, so `setcausal` stays closer to the base
+  model's pretrained attention pattern
+- this may make LoRA adaptation easier for long judge responses
+
+Why the paper-style `SetMask` may still be stronger:
+
+- for an already-given prompt, bidirectional attention inside a response can
+  build richer prompt representations than causal-within-response attention
+- response generation still remains autoregressive in both designs
+
+So the current expectation is:
+
+- `setllm` may have the better ceiling because prompt encoding is less
+  constrained
+- `setcausal` may fine-tune more smoothly because it is a smaller departure from
+  a pretrained decoder-only backbone
+
+This is an empirical question, so the repo keeps both variants for direct judge
+ablation.
+
 Current pairwise metrics are:
 
 - `accuracy`
