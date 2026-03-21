@@ -321,3 +321,27 @@ Implication:
 Fix applied:
 
 - judge training now augments each pairwise example with a swapped-order copy and the correspondingly swapped label
+
+### 2026-03-21 Eval Optimization
+
+The pairwise judge eval loop was spending most of its time rebuilding prompt encodings and running three separate forwards for `A`, `B`, and `Tie` for every prompt.
+
+Optimization applied in `reproduce_setllm.py`:
+
+- added reusable `PromptTokens` bundles
+- cache prompt tokenization per prompt during eval
+- batch `A`, `B`, and `Tie` scoring into a single forward pass instead of three separate forwards
+- reuse the same prompt-token bundle for the default and swapped prompt scoring path
+- batch multiple judge prompts together during eval with `--eval-batch-size`
+- cache prompt-side attention patterns and only extend them for response tokens
+
+Expected effect:
+
+- lower Python overhead
+- fewer attention mask constructions
+- better GPU utilization during judge eval
+
+Implementation note:
+
+- batched scoring must avoid passing `labels` through the model forward, otherwise Hugging Face computes the full training loss over the entire batched candidate set and can cause large, unnecessary memory spikes during eval
+- eval scoring now calls the model without `labels` and computes token NLL externally

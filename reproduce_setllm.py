@@ -68,6 +68,15 @@ class EncodedExample:
     metadata: dict
 
 
+@dataclass(frozen=True)
+class PromptTokens:
+    input_ids: list[int]
+    position_ids: list[int]
+    set_ids: list[int]
+    seq_ids: list[int]
+    prompt_pattern: torch.Tensor | None = None
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -101,6 +110,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--permutations-limit", type=int, default=None)
     parser.add_argument("--learning-rate", type=float, default=1e-3)
     parser.add_argument("--batch-size", type=int, default=10)
+    parser.add_argument(
+        "--eval-batch-size",
+        type=int,
+        default=2,
+        help="Number of judge prompts to score together during evaluation.",
+    )
     parser.add_argument("--gradient-accumulation-steps", type=int, default=10)
     parser.add_argument("--lora-r", type=int, default=8)
     parser.add_argument("--lora-alpha", type=int, default=1)
@@ -286,6 +301,37 @@ def build_prompt_tokens(
     return build_setpe_prompt_tokens(tokenizer, mixed_prompt, add_bos=add_bos)
 
 
+def build_prompt_token_bundle(
+    tokenizer: AutoTokenizer,
+    mixed_prompt: Sequence[TextSpan | SetSpan],
+    *,
+    add_bos: bool,
+    architecture: str,
+) -> PromptTokens:
+    input_ids, position_ids, set_ids, seq_ids = build_prompt_tokens(
+        tokenizer,
+        mixed_prompt,
+        add_bos=add_bos,
+        architecture=architecture,
+    )
+    prompt_pattern = None
+    if architecture != "vanilla":
+        prompt_pattern = build_attention_pattern(
+            len(input_ids),
+            len(input_ids),
+            set_ids,
+            seq_ids,
+            architecture,
+        )
+    return PromptTokens(
+        input_ids=input_ids,
+        position_ids=position_ids,
+        set_ids=set_ids,
+        seq_ids=seq_ids,
+        prompt_pattern=prompt_pattern,
+    )
+
+
 def append_response_tokens(
     tokenizer: AutoTokenizer,
     *,
@@ -382,6 +428,28 @@ def build_attention_pattern(
     return allowed
 
 
+def extend_prompt_attention_pattern(
+    prompt_tokens: PromptTokens,
+    response_length: int,
+    architecture: str,
+) -> torch.Tensor:
+    prompt_length = len(prompt_tokens.input_ids)
+    seq_len = prompt_length + response_length
+    if architecture == "vanilla":
+        raise ValueError(
+            "extend_prompt_attention_pattern is only for set architectures"
+        )
+    if prompt_tokens.prompt_pattern is None:
+        raise ValueError("prompt_tokens.prompt_pattern must be precomputed")
+
+    pattern = torch.zeros((seq_len, seq_len), dtype=torch.bool)
+    pattern[:prompt_length, :prompt_length] = prompt_tokens.prompt_pattern
+    for query_idx in range(prompt_length, seq_len):
+        pattern[query_idx, :prompt_length] = True
+        pattern[query_idx, prompt_length : query_idx + 1] = True
+    return pattern
+
+
 def batch_to_model_inputs(
     batch: list[EncodedExample],
     tokenizer: AutoTokenizer,
@@ -408,13 +476,15 @@ def batch_to_model_inputs(
             attention_mask = [1] * length + [0] * pad_len
             attention_masks.append(attention_mask)
         else:
-            pattern = build_attention_pattern(
-                item.prompt_length,
-                length,
-                item.set_ids,
-                item.seq_ids,
-                architecture,
-            )
+            pattern = item.metadata.get("attention_pattern")
+            if pattern is None:
+                pattern = build_attention_pattern(
+                    item.prompt_length,
+                    length,
+                    item.set_ids,
+                    item.seq_ids,
+                    architecture,
+                )
             if pad_len:
                 padded_pattern = torch.zeros((max_len, max_len), dtype=torch.bool)
                 padded_pattern[:length, :length] = pattern
@@ -441,6 +511,18 @@ def batch_to_model_inputs(
             torch.stack(attention_masks, dim=0).unsqueeze(1).to(device)
         )
     return model_inputs
+
+
+def forward_for_scoring(
+    model: nn.Module,
+    model_inputs: dict[str, torch.Tensor],
+) -> torch.Tensor:
+    outputs = model(
+        input_ids=model_inputs["input_ids"],
+        attention_mask=model_inputs["attention_mask"],
+        position_ids=model_inputs["position_ids"],
+    )
+    return outputs.logits
 
 
 def prompt_for_piqa(
@@ -1010,26 +1092,53 @@ def score_candidate_answer(
     prompt: MixedPrompt,
     candidate_answer: str,
 ) -> float:
-    prompt_ids, prompt_positions, prompt_set_ids, prompt_seq_ids = build_prompt_tokens(
+    prompt_tokens = build_prompt_token_bundle(
         tokenizer,
         prompt,
         add_bos=True,
         architecture=architecture,
     )
+    return score_candidate_answer_from_tokens(
+        model,
+        tokenizer,
+        device,
+        dtype,
+        architecture,
+        prompt_tokens,
+        candidate_answer,
+    )
+
+
+@torch.no_grad()
+def score_candidate_answer_from_tokens(
+    model: nn.Module,
+    tokenizer: AutoTokenizer,
+    device: torch.device,
+    dtype: torch.dtype,
+    architecture: str,
+    prompt_tokens: PromptTokens,
+    candidate_answer: str,
+) -> float:
     encoded = append_response_tokens(
         tokenizer,
-        prompt_ids=prompt_ids,
-        prompt_position_ids=prompt_positions,
-        prompt_set_ids=prompt_set_ids,
-        prompt_seq_ids=prompt_seq_ids,
+        prompt_ids=prompt_tokens.input_ids,
+        prompt_position_ids=prompt_tokens.position_ids,
+        prompt_set_ids=prompt_tokens.set_ids,
+        prompt_seq_ids=prompt_tokens.seq_ids,
         response_text=candidate_answer,
         add_eos=True,
     )
+    if architecture != "vanilla":
+        full_pattern = extend_prompt_attention_pattern(
+            prompt_tokens,
+            len(encoded.input_ids) - encoded.prompt_length,
+            architecture,
+        )
+        encoded.metadata["attention_pattern"] = full_pattern
     model_inputs = batch_to_model_inputs(
         [encoded], tokenizer, device, dtype, architecture
     )
-    outputs = model(**model_inputs)
-    logits = outputs.logits[:, :-1, :]
+    logits = forward_for_scoring(model, model_inputs)[:, :-1, :]
     labels = model_inputs["labels"][:, 1:]
     loss_fct = nn.CrossEntropyLoss(ignore_index=IGNORE_INDEX, reduction="none")
     token_losses = loss_fct(
@@ -1038,6 +1147,110 @@ def score_candidate_answer(
     answer_mask = labels.ne(IGNORE_INDEX)
     nll = token_losses[answer_mask].sum().item()
     return -nll
+
+
+@torch.no_grad()
+def score_candidate_answers_from_tokens(
+    model: nn.Module,
+    tokenizer: AutoTokenizer,
+    device: torch.device,
+    dtype: torch.dtype,
+    architecture: str,
+    prompt_tokens: PromptTokens,
+    candidate_answers: Sequence[str],
+) -> list[float]:
+    encoded_batch = [
+        append_response_tokens(
+            tokenizer,
+            prompt_ids=prompt_tokens.input_ids,
+            prompt_position_ids=prompt_tokens.position_ids,
+            prompt_set_ids=prompt_tokens.set_ids,
+            prompt_seq_ids=prompt_tokens.seq_ids,
+            response_text=answer,
+            add_eos=True,
+        )
+        for answer in candidate_answers
+    ]
+    if architecture != "vanilla":
+        for encoded in encoded_batch:
+            encoded.metadata["attention_pattern"] = extend_prompt_attention_pattern(
+                prompt_tokens,
+                len(encoded.input_ids) - encoded.prompt_length,
+                architecture,
+            )
+    model_inputs = batch_to_model_inputs(
+        encoded_batch, tokenizer, device, dtype, architecture
+    )
+    logits = forward_for_scoring(model, model_inputs)[:, :-1, :]
+    labels = model_inputs["labels"][:, 1:]
+    loss_fct = nn.CrossEntropyLoss(ignore_index=IGNORE_INDEX, reduction="none")
+    token_losses = loss_fct(
+        logits.reshape(-1, logits.size(-1)), labels.reshape(-1)
+    ).view_as(labels)
+    scores = []
+    for batch_index in range(labels.size(0)):
+        answer_mask = labels[batch_index].ne(IGNORE_INDEX)
+        nll = token_losses[batch_index][answer_mask].sum().item()
+        scores.append(-nll)
+    return scores
+
+
+@torch.no_grad()
+def classify_judge_pairwise_batch_from_tokens(
+    model: nn.Module,
+    tokenizer: AutoTokenizer,
+    device: torch.device,
+    dtype: torch.dtype,
+    architecture: str,
+    prompt_tokens_batch: Sequence[PromptTokens],
+) -> list[str]:
+    encoded_batch = []
+    for prompt_tokens in prompt_tokens_batch:
+        for label in JUDGE_LABELS:
+            encoded = append_response_tokens(
+                tokenizer,
+                prompt_ids=prompt_tokens.input_ids,
+                prompt_position_ids=prompt_tokens.position_ids,
+                prompt_set_ids=prompt_tokens.set_ids,
+                prompt_seq_ids=prompt_tokens.seq_ids,
+                response_text=label,
+                add_eos=True,
+            )
+            if architecture != "vanilla":
+                encoded.metadata["attention_pattern"] = extend_prompt_attention_pattern(
+                    prompt_tokens,
+                    len(encoded.input_ids) - encoded.prompt_length,
+                    architecture,
+                )
+            encoded_batch.append(encoded)
+
+    model_inputs = batch_to_model_inputs(
+        encoded_batch, tokenizer, device, dtype, architecture
+    )
+    logits = forward_for_scoring(model, model_inputs)[:, :-1, :]
+    labels = model_inputs["labels"][:, 1:]
+    loss_fct = nn.CrossEntropyLoss(ignore_index=IGNORE_INDEX, reduction="none")
+    token_losses = loss_fct(
+        logits.reshape(-1, logits.size(-1)), labels.reshape(-1)
+    ).view_as(labels)
+
+    all_scores = []
+    for batch_index in range(labels.size(0)):
+        answer_mask = labels[batch_index].ne(IGNORE_INDEX)
+        nll = token_losses[batch_index][answer_mask].sum().item()
+        all_scores.append(-nll)
+
+    predictions = []
+    for start in range(0, len(all_scores), len(JUDGE_LABELS)):
+        group = all_scores[start : start + len(JUDGE_LABELS)]
+        best_index = max(range(len(group)), key=group.__getitem__)
+        predictions.append(JUDGE_LABELS[best_index])
+    return predictions
+
+
+def clear_cuda_cache() -> None:
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
 def classify_example(
@@ -1076,6 +1289,28 @@ def gold_answer(task: str, example: dict) -> str:
 
 
 @torch.no_grad()
+def classify_judge_pairwise_from_tokens(
+    model: nn.Module,
+    tokenizer: AutoTokenizer,
+    device: torch.device,
+    dtype: torch.dtype,
+    architecture: str,
+    prompt_tokens: PromptTokens,
+) -> str:
+    scores = score_candidate_answers_from_tokens(
+        model,
+        tokenizer,
+        device,
+        dtype,
+        architecture,
+        prompt_tokens,
+        JUDGE_LABELS,
+    )
+    best_index = max(range(len(scores)), key=scores.__getitem__)
+    return JUDGE_LABELS[best_index]
+
+
+@torch.no_grad()
 def classify_judge_pairwise(
     model: nn.Module,
     tokenizer: AutoTokenizer,
@@ -1084,22 +1319,20 @@ def classify_judge_pairwise(
     architecture: str,
     prompt: Sequence[TextSpan | SetSpan],
 ) -> str:
-    best_label = "Tie"
-    best_score = None
-    for label in JUDGE_LABELS:
-        score = score_candidate_answer(
-            model,
-            tokenizer,
-            device,
-            dtype,
-            architecture,
-            prompt,
-            label,
-        )
-        if best_score is None or score > best_score:
-            best_score = score
-            best_label = label
-    return best_label
+    prompt_tokens = build_prompt_token_bundle(
+        tokenizer,
+        prompt,
+        add_bos=True,
+        architecture=architecture,
+    )
+    return classify_judge_pairwise_from_tokens(
+        model,
+        tokenizer,
+        device,
+        dtype,
+        architecture,
+        prompt_tokens,
+    )
 
 
 @torch.no_grad()
@@ -1121,34 +1354,69 @@ def evaluate_judge_pairwise(
     first_position_wins = 0.0
     swapped_first_position_wins = 0.0
 
-    for row in dataset:
-        prompt_default, gold = prompt_for_judge_pairwise(row, swap=False)
-        prompt_swapped, swapped_gold = prompt_for_judge_pairwise(row, swap=True)
+    rows = list(dataset)
+    batch_size = max(1, args.eval_batch_size)
+    start = 0
+    while start < len(rows):
+        current_batch_size = min(batch_size, len(rows) - start)
+        batch_rows = rows[start : start + current_batch_size]
+        default_prompt_tokens = []
+        swapped_prompt_tokens = []
+        gold_labels = []
+        for row in batch_rows:
+            prompt_default, gold = prompt_for_judge_pairwise(row, swap=False)
+            prompt_swapped, _ = prompt_for_judge_pairwise(row, swap=True)
+            default_prompt_tokens.append(
+                build_prompt_token_bundle(
+                    tokenizer,
+                    prompt_default,
+                    add_bos=True,
+                    architecture=args.architecture,
+                )
+            )
+            swapped_prompt_tokens.append(
+                build_prompt_token_bundle(
+                    tokenizer,
+                    prompt_swapped,
+                    add_bos=True,
+                    architecture=args.architecture,
+                )
+            )
+            gold_labels.append(gold)
 
-        pred = classify_judge_pairwise(
-            model,
-            tokenizer,
-            device,
-            dtype,
-            args.architecture,
-            prompt_default,
-        )
-        pred_swapped = classify_judge_pairwise(
-            model,
-            tokenizer,
-            device,
-            dtype,
-            args.architecture,
-            prompt_swapped,
-        )
+        try:
+            preds = classify_judge_pairwise_batch_from_tokens(
+                model,
+                tokenizer,
+                device,
+                dtype,
+                args.architecture,
+                default_prompt_tokens,
+            )
+            preds_swapped = classify_judge_pairwise_batch_from_tokens(
+                model,
+                tokenizer,
+                device,
+                dtype,
+                args.architecture,
+                swapped_prompt_tokens,
+            )
+        except torch.OutOfMemoryError:
+            if current_batch_size == 1:
+                raise
+            clear_cuda_cache()
+            batch_size = max(1, current_batch_size // 2)
+            continue
 
-        total += 1
-        accuracy += 1.0 if pred == gold else 0.0
-        swap_consistency += 1.0 if pred_swapped == swap_judge_label(pred) else 0.0
-        first_position_wins += 1.0 if pred == "A" else 0.0
-        swapped_first_position_wins += 1.0 if pred_swapped == "A" else 0.0
-
-        _ = swapped_gold
+        for gold, pred, pred_swapped in zip(
+            gold_labels, preds, preds_swapped, strict=True
+        ):
+            total += 1
+            accuracy += 1.0 if pred == gold else 0.0
+            swap_consistency += 1.0 if pred_swapped == swap_judge_label(pred) else 0.0
+            first_position_wins += 1.0 if pred == "A" else 0.0
+            swapped_first_position_wins += 1.0 if pred_swapped == "A" else 0.0
+        start += current_batch_size
 
     return {
         "accuracy": accuracy / total,
