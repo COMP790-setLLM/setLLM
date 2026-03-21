@@ -127,8 +127,14 @@ For this task:
 
 - `--architecture vanilla` uses the base decoder causal mask.
 - `--architecture setllm` uses SetPE with the original SetMask prompt-side visibility.
-- `--architecture setcausal` uses SetPE with causal attention inside each response and
-  blocked attention across different candidate responses.
+- `--architecture setcausal` uses SetPE with the base decoder causal mask everywhere,
+  plus blocked attention across different candidate responses inside the same set.
+
+In other words, `setcausal` is the proposed long-response variant:
+
+- tokens can only attend to earlier tokens, as in a normal decoder LM
+- tokens in one candidate response cannot attend to tokens in another candidate response
+- non-set scaffold text is causal too; it is not fully visible prompt context
 
 Current pairwise metrics are:
 

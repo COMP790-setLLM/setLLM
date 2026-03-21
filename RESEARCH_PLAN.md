@@ -48,8 +48,9 @@ Definition:
 - Candidate responses are still treated as set elements.
 - `SetPE` is applied as in Set-LLM.
 - Attention across different candidate responses is blocked.
+- The underlying prompt mask is otherwise the standard decoder causal mask.
 - Within each candidate response, attention is causal in local token order.
-- Non-set scaffold text can remain visible as prompt context.
+- Non-set scaffold text is causal too, so the full prompt remains decoder-style.
 - Judge output tokens attend to all prompt tokens and previous output tokens only.
 
 This should preserve permutation robustness across responses while avoiding the fully visible

@@ -345,3 +345,18 @@ Implementation note:
 
 - batched scoring must avoid passing `labels` through the model forward, otherwise Hugging Face computes the full training loss over the entire batched candidate set and can cause large, unnecessary memory spikes during eval
 - eval scoring now calls the model without `labels` and computes token NLL externally
+
+### 2026-03-21 Set-Causal Mask Correction
+
+- The original `setcausal` implementation was a hybrid prompt mask:
+  - same-response tokens were causal
+  - cross-response attention inside a set was blocked
+  - but other prompt tokens could still be fully visible
+- This did not match the intended proposed `set-causal` variant for long responses.
+- `setcausal` is now corrected to mean:
+  - start from the base decoder causal mask everywhere
+  - additionally block attention across different candidate responses inside the same set
+- This keeps the entire prompt decoder-style while preserving the no-cross-response constraint.
+- Important result-tracking note:
+  - all earlier `setcausal` runs recorded above used the pre-fix hybrid mask
+  - those numbers are therefore not directly comparable to future runs with the corrected implementation

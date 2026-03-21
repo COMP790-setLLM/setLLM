@@ -405,6 +405,8 @@ def build_attention_pattern(
     for query_idx in range(seq_len):
         for key_idx in range(seq_len):
             if query_idx < prompt_length:
+                if architecture == "setcausal" and key_idx > query_idx:
+                    continue
                 if key_idx >= prompt_length:
                     continue
                 same_set = (
@@ -413,9 +415,6 @@ def build_attention_pattern(
                 different_element = seq_ids[query_idx] != seq_ids[key_idx]
                 if same_set and different_element:
                     allowed[query_idx, key_idx] = False
-                    continue
-                if architecture == "setcausal" and same_set and seq_ids[query_idx] >= 0:
-                    allowed[query_idx, key_idx] = key_idx <= query_idx
                     continue
                 allowed[query_idx, key_idx] = True
                 continue
