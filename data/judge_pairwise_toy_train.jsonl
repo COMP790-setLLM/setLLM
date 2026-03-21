@@ -1,0 +1,3 @@
+{"prompt":"Explain why the sky appears blue during the day.","response_a":"The sky looks blue because molecules in the atmosphere scatter shorter wavelengths of sunlight, especially blue light, more strongly than red light.","response_b":"The sky is blue because the ocean reflects onto it.","label":"A"}
+{"prompt":"Write a short email declining a meeting politely.","response_a":"No.","response_b":"Hi Alex, thank you for the invitation. I will not be able to attend the meeting, but I appreciate the invite and hope it goes well. Best, Sam","label":"B"}
+{"prompt":"What is 2 + 2?","response_a":"2 + 2 equals 4.","response_b":"The answer is 4.","label":"Tie"}

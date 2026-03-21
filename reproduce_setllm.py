@@ -5,6 +5,7 @@ This script implements the core ingredients described in the paper:
   - Set position encoding (SetPE)
   - Set attention masking (SetMask)
   - Benchmark prompt formatting for PIQA / ARC / CSQA / SIQA
+  - Pairwise LLM-as-a-judge prompt formatting
   - Optional extra pretraining on a cleaned instruction-answer JSONL
   - LoRA finetuning and permutation-based evaluation
 
@@ -32,10 +33,15 @@ from datasets import Dataset, load_dataset
 from peft import LoraConfig, PeftModel, get_peft_model
 from torch import nn
 from torch.utils.data import DataLoader
-from transformers import AutoModelForCausalLM, AutoTokenizer, get_linear_schedule_with_warmup
+from transformers import (
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    get_linear_schedule_with_warmup,
+)
 
 
 IGNORE_INDEX = -100
+JUDGE_LABELS = ("A", "B", "Tie")
 
 
 @dataclass
@@ -48,7 +54,7 @@ class SetSpan:
     elements: list[str]
 
 
-MixedPrompt = list[TextSpan | SetSpan]
+MixedPrompt = Sequence[TextSpan | SetSpan]
 
 
 @dataclass
@@ -64,16 +70,18 @@ class EncodedExample:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--model", required=True, help="HF model id, e.g. google/gemma-2b")
+    parser.add_argument(
+        "--model", required=True, help="HF model id, e.g. google/gemma-2b"
+    )
     parser.add_argument(
         "--task",
-        choices=["piqa", "arc", "csqa", "siqa"],
+        choices=["piqa", "arc", "csqa", "siqa", "judge_pairwise"],
         required=True,
         help="Benchmark to finetune/evaluate.",
     )
     parser.add_argument(
         "--architecture",
-        choices=["setllm", "vanilla"],
+        choices=["setllm", "setcausal", "vanilla"],
         default="setllm",
         help="Use Set-LLM masking/positions or the base model's native causal attention path.",
     )
@@ -94,12 +102,34 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--learning-rate", type=float, default=1e-3)
     parser.add_argument("--batch-size", type=int, default=10)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=10)
+    parser.add_argument("--lora-r", type=int, default=8)
+    parser.add_argument("--lora-alpha", type=int, default=1)
+    parser.add_argument("--lora-dropout", type=float, default=0.0)
+    parser.add_argument(
+        "--gradient-checkpointing",
+        action="store_true",
+        help="Enable gradient checkpointing to reduce memory during training.",
+    )
+    parser.add_argument(
+        "--max-seq-len",
+        type=int,
+        default=None,
+        help="Optional maximum total sequence length. If set, examples are left-truncated to fit.",
+    )
     parser.add_argument("--warmup-steps", type=int, default=300)
     parser.add_argument("--update-steps", type=int, default=3000)
     parser.add_argument("--weight-decay", type=float, default=0.0)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--bf16", action="store_true", help="Load/train in bfloat16 when CUDA is available.")
-    parser.add_argument("--fp32-eval", action="store_true", help="Run evaluation in float32 as in the paper.")
+    parser.add_argument(
+        "--bf16",
+        action="store_true",
+        help="Load/train in bfloat16 when CUDA is available.",
+    )
+    parser.add_argument(
+        "--fp32-eval",
+        action="store_true",
+        help="Run evaluation in float32 as in the paper.",
+    )
     parser.add_argument("--do-train", action="store_true")
     parser.add_argument("--do-eval", action="store_true")
     parser.add_argument("--save-every", type=int, default=500)
@@ -109,9 +139,31 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="Run validation every N optimizer updates during benchmark finetuning. Disabled when set to 0.",
     )
-    parser.add_argument("--wandb-project", default=None, help="Weights & Biases project name.")
-    parser.add_argument("--wandb-entity", default=None, help="Weights & Biases entity/team.")
-    parser.add_argument("--wandb-run-name", default=None, help="Optional Weights & Biases run name.")
+    parser.add_argument(
+        "--wandb-project", default=None, help="Weights & Biases project name."
+    )
+    parser.add_argument(
+        "--wandb-entity", default=None, help="Weights & Biases entity/team."
+    )
+    parser.add_argument(
+        "--wandb-run-name", default=None, help="Optional Weights & Biases run name."
+    )
+    parser.add_argument(
+        "--judge-train-jsonl",
+        default=None,
+        help=(
+            "JSONL for pairwise judge finetuning with rows like "
+            "{'prompt': ..., 'response_a': ..., 'response_b': ..., 'label': 'A'|'B'|'Tie'}"
+        ),
+    )
+    parser.add_argument(
+        "--judge-eval-jsonl",
+        default=None,
+        help=(
+            "JSONL for pairwise judge evaluation with rows like "
+            "{'prompt': ..., 'response_a': ..., 'response_b': ..., 'label': 'A'|'B'|'Tie'}"
+        ),
+    )
     return parser.parse_args()
 
 
@@ -140,7 +192,9 @@ def tokenize_text(tokenizer: AutoTokenizer, text: str) -> list[int]:
     return tokenizer(text, add_special_tokens=False)["input_ids"]
 
 
-def iter_permutations(items: Sequence[str], limit: int | None) -> Iterator[tuple[str, ...]]:
+def iter_permutations(
+    items: Sequence[str], limit: int | None
+) -> Iterator[tuple[str, ...]]:
     perms = itertools.permutations(items)
     if limit is None:
         yield from perms
@@ -153,7 +207,7 @@ def iter_permutations(items: Sequence[str], limit: int | None) -> Iterator[tuple
 
 def build_setpe_prompt_tokens(
     tokenizer: AutoTokenizer,
-    mixed_prompt: MixedPrompt,
+    mixed_prompt: Sequence[TextSpan | SetSpan],
     *,
     add_bos: bool,
 ) -> tuple[list[int], list[int], list[int], list[int]]:
@@ -198,7 +252,7 @@ def build_setpe_prompt_tokens(
 
 def build_vanilla_prompt_tokens(
     tokenizer: AutoTokenizer,
-    mixed_prompt: MixedPrompt,
+    mixed_prompt: Sequence[TextSpan | SetSpan],
     *,
     add_bos: bool,
 ) -> tuple[list[int], list[int], list[int], list[int]]:
@@ -222,7 +276,7 @@ def build_vanilla_prompt_tokens(
 
 def build_prompt_tokens(
     tokenizer: AutoTokenizer,
-    mixed_prompt: MixedPrompt,
+    mixed_prompt: Sequence[TextSpan | SetSpan],
     *,
     add_bos: bool,
     architecture: str,
@@ -264,11 +318,41 @@ def append_response_tokens(
     )
 
 
+def truncate_encoded_example(
+    encoded: EncodedExample,
+    max_seq_len: int | None,
+) -> EncodedExample:
+    if max_seq_len is None or len(encoded.input_ids) <= max_seq_len:
+        return encoded
+    if max_seq_len <= 0:
+        raise ValueError("max_seq_len must be positive")
+
+    trim = len(encoded.input_ids) - max_seq_len
+    input_ids = encoded.input_ids[trim:]
+    labels = encoded.labels[trim:]
+    position_ids = encoded.position_ids[trim:]
+    set_ids = encoded.set_ids[trim:]
+    seq_ids = encoded.seq_ids[trim:]
+    prompt_length = max(0, encoded.prompt_length - trim)
+    if prompt_length == 0 and any(label != IGNORE_INDEX for label in labels):
+        prompt_length = 1
+    return EncodedExample(
+        input_ids=input_ids,
+        labels=labels,
+        position_ids=position_ids,
+        set_ids=set_ids,
+        seq_ids=seq_ids,
+        prompt_length=prompt_length,
+        metadata=encoded.metadata,
+    )
+
+
 def build_attention_pattern(
     prompt_length: int,
     seq_len: int,
     set_ids: Sequence[int],
     seq_ids: Sequence[int],
+    architecture: str,
 ) -> torch.Tensor:
     allowed = torch.zeros((seq_len, seq_len), dtype=torch.bool)
 
@@ -277,13 +361,23 @@ def build_attention_pattern(
             if query_idx < prompt_length:
                 if key_idx >= prompt_length:
                     continue
-                same_set = set_ids[query_idx] >= 0 and set_ids[query_idx] == set_ids[key_idx]
+                same_set = (
+                    set_ids[query_idx] >= 0 and set_ids[query_idx] == set_ids[key_idx]
+                )
                 different_element = seq_ids[query_idx] != seq_ids[key_idx]
-                allowed[query_idx, key_idx] = not (same_set and different_element)
+                if same_set and different_element:
+                    allowed[query_idx, key_idx] = False
+                    continue
+                if architecture == "setcausal" and same_set and seq_ids[query_idx] >= 0:
+                    allowed[query_idx, key_idx] = key_idx <= query_idx
+                    continue
+                allowed[query_idx, key_idx] = True
                 continue
 
             # Prefix-style prompt attention + causal attention over response.
-            allowed[query_idx, key_idx] = key_idx < prompt_length or key_idx <= query_idx
+            allowed[query_idx, key_idx] = (
+                key_idx < prompt_length or key_idx <= query_idx
+            )
 
     return allowed
 
@@ -314,7 +408,13 @@ def batch_to_model_inputs(
             attention_mask = [1] * length + [0] * pad_len
             attention_masks.append(attention_mask)
         else:
-            pattern = build_attention_pattern(item.prompt_length, length, item.set_ids, item.seq_ids)
+            pattern = build_attention_pattern(
+                item.prompt_length,
+                length,
+                item.set_ids,
+                item.seq_ids,
+                architecture,
+            )
             if pad_len:
                 padded_pattern = torch.zeros((max_len, max_len), dtype=torch.bool)
                 padded_pattern[:length, :length] = pattern
@@ -333,13 +433,19 @@ def batch_to_model_inputs(
         "position_ids": torch.tensor(position_ids, dtype=torch.long, device=device),
     }
     if architecture == "vanilla":
-        model_inputs["attention_mask"] = torch.tensor(attention_masks, dtype=torch.long, device=device)
+        model_inputs["attention_mask"] = torch.tensor(
+            attention_masks, dtype=torch.long, device=device
+        )
     else:
-        model_inputs["attention_mask"] = torch.stack(attention_masks, dim=0).unsqueeze(1).to(device)
+        model_inputs["attention_mask"] = (
+            torch.stack(attention_masks, dim=0).unsqueeze(1).to(device)
+        )
     return model_inputs
 
 
-def prompt_for_piqa(example: dict, permutation: Sequence[str] | None = None) -> tuple[MixedPrompt, str, list[str]]:
+def prompt_for_piqa(
+    example: dict, permutation: Sequence[str] | None = None
+) -> tuple[MixedPrompt, str, list[str]]:
     choices = [example["sol1"].strip(), example["sol2"].strip()]
     ordered = list(permutation) if permutation is not None else choices
     answer = choices[example["label"]]
@@ -351,10 +457,15 @@ def prompt_for_piqa(example: dict, permutation: Sequence[str] | None = None) -> 
     return prompt, answer, ordered
 
 
-def prompt_for_arc(example: dict, permutation: Sequence[str] | None = None) -> tuple[MixedPrompt, str, list[str]]:
+def prompt_for_arc(
+    example: dict, permutation: Sequence[str] | None = None
+) -> tuple[MixedPrompt, str, list[str]]:
     raw_choices = example["choices"]["text"]
     raw_labels = example["choices"]["label"]
-    label_to_choice = {label: choice.strip() for label, choice in zip(raw_labels, raw_choices, strict=True)}
+    label_to_choice = {
+        label: choice.strip()
+        for label, choice in zip(raw_labels, raw_choices, strict=True)
+    }
     choices = [choice.strip() for choice in raw_choices]
     ordered = list(permutation) if permutation is not None else choices
     answer = label_to_choice[str(example["answerKey"]).strip()]
@@ -366,10 +477,15 @@ def prompt_for_arc(example: dict, permutation: Sequence[str] | None = None) -> t
     return prompt, answer, ordered
 
 
-def prompt_for_csqa(example: dict, permutation: Sequence[str] | None = None) -> tuple[MixedPrompt, str, list[str]]:
+def prompt_for_csqa(
+    example: dict, permutation: Sequence[str] | None = None
+) -> tuple[MixedPrompt, str, list[str]]:
     raw_choices = example["choices"]["text"]
     raw_labels = example["choices"]["label"]
-    label_to_choice = {label: choice.strip() for label, choice in zip(raw_labels, raw_choices, strict=True)}
+    label_to_choice = {
+        label: choice.strip()
+        for label, choice in zip(raw_labels, raw_choices, strict=True)
+    }
     choices = [choice.strip() for choice in raw_choices]
     ordered = list(permutation) if permutation is not None else choices
     answer = label_to_choice[str(example["answerKey"]).strip()]
@@ -381,8 +497,14 @@ def prompt_for_csqa(example: dict, permutation: Sequence[str] | None = None) -> 
     return prompt, answer, ordered
 
 
-def prompt_for_siqa(example: dict, permutation: Sequence[str] | None = None) -> tuple[MixedPrompt, str, list[str]]:
-    choices = [example["answerA"].strip(), example["answerB"].strip(), example["answerC"].strip()]
+def prompt_for_siqa(
+    example: dict, permutation: Sequence[str] | None = None
+) -> tuple[MixedPrompt, str, list[str]]:
+    choices = [
+        example["answerA"].strip(),
+        example["answerB"].strip(),
+        example["answerC"].strip(),
+    ]
     ordered = list(permutation) if permutation is not None else choices
     label_idx = int(example["label"]) - 1
     answer = choices[label_idx]
@@ -420,6 +542,7 @@ def encode_benchmark_example(
     task: str,
     example: dict,
     architecture: str,
+    max_seq_len: int | None = None,
 ) -> EncodedExample:
     prompt_builder = PROMPT_BUILDERS[task]
     prompt, answer, ordered_choices = prompt_builder(example)
@@ -443,7 +566,7 @@ def encode_benchmark_example(
         "choices": ordered_choices,
         "task": task,
     }
-    return encoded
+    return truncate_encoded_example(encoded, max_seq_len)
 
 
 def encode_instruction_example(
@@ -451,6 +574,7 @@ def encode_instruction_example(
     instruction: str,
     answer: str,
     architecture: str,
+    max_seq_len: int | None = None,
 ) -> EncodedExample:
     prompt = [TextSpan(f"Question: {instruction.strip()}\n\nAnswer:\n")]
     prompt_ids, prompt_positions, prompt_set_ids, prompt_seq_ids = build_prompt_tokens(
@@ -469,7 +593,99 @@ def encode_instruction_example(
         add_eos=True,
     )
     encoded.metadata = {"instruction": instruction}
-    return encoded
+    return truncate_encoded_example(encoded, max_seq_len)
+
+
+def normalize_judge_label(label: str) -> str:
+    value = label.strip().lower()
+    mapping = {
+        "a": "A",
+        "assistant a": "A",
+        "model a": "A",
+        "response a": "A",
+        "b": "B",
+        "assistant b": "B",
+        "model b": "B",
+        "response b": "B",
+        "tie": "Tie",
+        "draw": "Tie",
+        "equal": "Tie",
+    }
+    if value not in mapping:
+        raise ValueError(f"Unsupported judge label: {label}")
+    return mapping[value]
+
+
+def swap_judge_label(label: str) -> str:
+    normalized = normalize_judge_label(label)
+    if normalized == "A":
+        return "B"
+    if normalized == "B":
+        return "A"
+    return normalized
+
+
+def prompt_for_judge_pairwise(
+    example: dict,
+    *,
+    swap: bool = False,
+) -> tuple[MixedPrompt, str]:
+    response_a = example["response_a"].strip()
+    response_b = example["response_b"].strip()
+    label = normalize_judge_label(example["label"])
+    if swap:
+        response_a, response_b = response_b, response_a
+        label = swap_judge_label(label)
+
+    prompt: MixedPrompt = [
+        TextSpan(
+            "You are an impartial judge evaluating the quality of two assistant responses.\n"
+            "Consider helpfulness, correctness, completeness, and instruction following.\n"
+            "Return exactly one label: A, B, or Tie.\n\n"
+            f"User prompt:\n{example['prompt'].strip()}\n\n"
+            "Candidate responses:\n"
+        ),
+        SetSpan(
+            [
+                f"[Response A]\n{response_a}\n",
+                f"[Response B]\n{response_b}\n",
+            ]
+        ),
+        TextSpan("\nJudgment:\n"),
+    ]
+    return prompt, label
+
+
+def encode_judge_example(
+    tokenizer: AutoTokenizer,
+    example: dict,
+    architecture: str,
+    max_seq_len: int | None = None,
+    *,
+    swap: bool = False,
+) -> EncodedExample:
+    prompt, label = prompt_for_judge_pairwise(example, swap=swap)
+    prompt_ids, prompt_positions, prompt_set_ids, prompt_seq_ids = build_prompt_tokens(
+        tokenizer,
+        prompt,
+        add_bos=True,
+        architecture=architecture,
+    )
+    encoded = append_response_tokens(
+        tokenizer,
+        prompt_ids=prompt_ids,
+        prompt_position_ids=prompt_positions,
+        prompt_set_ids=prompt_set_ids,
+        prompt_seq_ids=prompt_seq_ids,
+        response_text=label,
+        add_eos=True,
+    )
+    encoded.metadata = {
+        "task": "judge_pairwise",
+        "label": label,
+        "swapped": swap,
+    }
+    return truncate_encoded_example(encoded, max_seq_len)
 
 
 def select_rows(dataset: Dataset, limit: int | None, seed: int) -> Dataset:
@@ -488,6 +704,45 @@ def load_benchmark_dataset(task: str) -> tuple[Dataset, Dataset]:
         train = load_dataset(path, subset, split=train_split)
         eval_ds = load_dataset(path, subset, split=eval_split)
     return train, eval_ds
+
+
+def load_jsonl_dataset(path: str) -> Dataset:
+    rows = []
+    with Path(path).open() as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            rows.append(json.loads(line))
+    if not rows:
+        raise RuntimeError(f"No rows loaded from {path}")
+    return Dataset.from_list(rows)
+
+
+def load_task_datasets(args: argparse.Namespace) -> tuple[Dataset, Dataset]:
+    if args.task != "judge_pairwise":
+        return load_benchmark_dataset(args.task)
+
+    if args.judge_train_jsonl is None or args.judge_eval_jsonl is None:
+        raise RuntimeError(
+            "judge_pairwise requires both --judge-train-jsonl and --judge-eval-jsonl"
+        )
+
+    train_ds = load_jsonl_dataset(args.judge_train_jsonl)
+    eval_ds = load_jsonl_dataset(args.judge_eval_jsonl)
+    return train_ds, eval_ds
+
+
+def augment_judge_pairwise_dataset(dataset: Dataset) -> Dataset:
+    rows = []
+    for row in dataset:
+        base = dict(row)
+        base["__swap__"] = False
+        swapped = dict(row)
+        swapped["__swap__"] = True
+        rows.append(base)
+        rows.append(swapped)
+    return Dataset.from_list(rows)
 
 
 def load_cleaned_ultra(path: str, limit: int | None) -> Dataset:
@@ -514,7 +769,9 @@ def find_lora_target_modules(model: nn.Module) -> list[str]:
     return sorted(target)
 
 
-def load_model_and_tokenizer(args: argparse.Namespace, train: bool) -> tuple[AutoModelForCausalLM, AutoTokenizer]:
+def load_model_and_tokenizer(
+    args: argparse.Namespace, train: bool
+) -> tuple[AutoModelForCausalLM, AutoTokenizer]:
     tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=True)
     ensure_pad_token(tokenizer)
 
@@ -522,15 +779,20 @@ def load_model_and_tokenizer(args: argparse.Namespace, train: bool) -> tuple[Aut
     model = AutoModelForCausalLM.from_pretrained(
         args.model,
         torch_dtype=dtype,
+        low_cpu_mem_usage=True,
     )
     model.config.use_cache = False
 
     if train:
+        if args.gradient_checkpointing:
+            model.gradient_checkpointing_enable()
+            if hasattr(model, "enable_input_require_grads"):
+                model.enable_input_require_grads()
         target_modules = find_lora_target_modules(model)
         lora_config = LoraConfig(
-            r=8,
-            lora_alpha=1,
-            lora_dropout=0.0,
+            r=args.lora_r,
+            lora_alpha=args.lora_alpha,
+            lora_dropout=args.lora_dropout,
             bias="none",
             target_modules=target_modules,
             task_type="CAUSAL_LM",
@@ -583,7 +845,9 @@ def init_wandb(args: argparse.Namespace, output_dir: Path) -> Any | None:
     )
 
 
-def wandb_log(run: Any | None, payload: dict[str, Any], *, step: int | None = None) -> None:
+def wandb_log(
+    run: Any | None, payload: dict[str, Any], *, step: int | None = None
+) -> None:
     if run is None:
         return
     run.log(payload, step=step)
@@ -608,7 +872,9 @@ def run_training_epoch(
     running_loss = 0.0
 
     for step, batch in enumerate(dataloader, start=1):
-        model_inputs = batch_to_model_inputs(batch, tokenizer, device, dtype, architecture)
+        model_inputs = batch_to_model_inputs(
+            batch, tokenizer, device, dtype, architecture
+        )
         outputs = model(**model_inputs)
         loss = outputs.loss / gradient_accumulation_steps
         loss.backward()
@@ -642,11 +908,15 @@ def train_stage(
     device = get_device()
     dtype = get_dtype(args, train=True)
     encoded = [encode_fn(row) for row in dataset]
-    dataloader = DataLoader(encoded, batch_size=args.batch_size, shuffle=True, collate_fn=lambda rows: rows)
+    dataloader = DataLoader(
+        encoded, batch_size=args.batch_size, shuffle=True, collate_fn=lambda rows: rows
+    )
     model.to(device=device, dtype=dtype)
 
     trainable_params = [p for p in model.parameters() if p.requires_grad]
-    optimizer = torch.optim.AdamW(trainable_params, lr=args.learning_rate, weight_decay=args.weight_decay)
+    optimizer = torch.optim.AdamW(
+        trainable_params, lr=args.learning_rate, weight_decay=args.weight_decay
+    )
     scheduler = get_linear_schedule_with_warmup(
         optimizer,
         num_warmup_steps=args.warmup_steps,
@@ -671,7 +941,9 @@ def train_stage(
             global_step=global_step,
             max_steps=args.update_steps,
         )
-        print(f"[{stage_name}] epoch={epoch} step={global_step} avg_loss={avg_loss:.4f}")
+        print(
+            f"[{stage_name}] epoch={epoch} step={global_step} avg_loss={avg_loss:.4f}"
+        )
         wandb_log(
             wandb_run,
             {
@@ -688,6 +960,7 @@ def train_stage(
             and (global_step // args.eval_every) > (last_eval_step // args.eval_every)
         )
         if should_eval:
+            assert eval_task is not None
             metrics = evaluate_with_separate_model(
                 training_model=model,
                 tokenizer=tokenizer,
@@ -696,18 +969,23 @@ def train_stage(
                 args=args,
                 output_dir=output_dir,
             )
+            metric_parts = [
+                f"{key}={value:.4f}"
+                for key, value in metrics.items()
+                if key != "num_examples"
+            ]
+            metric_parts.append(f"num_examples={int(metrics['num_examples'])}")
             print(
                 f"[{stage_name}] validation step={global_step} "
-                f"random_order_accuracy={metrics['random_order_accuracy']:.4f} "
-                f"adversarial_order_accuracy={metrics['adversarial_order_accuracy']:.4f} "
-                f"num_examples={int(metrics['num_examples'])}"
+                + " ".join(metric_parts)
             )
             wandb_log(
                 wandb_run,
                 {
-                    f"{stage_name}/val_random_order_accuracy": metrics["random_order_accuracy"],
-                    f"{stage_name}/val_adversarial_order_accuracy": metrics["adversarial_order_accuracy"],
-                    f"{stage_name}/val_num_examples": int(metrics["num_examples"]),
+                    f"{stage_name}/val_{key}": (
+                        int(value) if key == "num_examples" else value
+                    )
+                    for key, value in metrics.items()
                 },
                 step=global_step,
             )
@@ -747,12 +1025,16 @@ def score_candidate_answer(
         response_text=candidate_answer,
         add_eos=True,
     )
-    model_inputs = batch_to_model_inputs([encoded], tokenizer, device, dtype, architecture)
+    model_inputs = batch_to_model_inputs(
+        [encoded], tokenizer, device, dtype, architecture
+    )
     outputs = model(**model_inputs)
     logits = outputs.logits[:, :-1, :]
     labels = model_inputs["labels"][:, 1:]
     loss_fct = nn.CrossEntropyLoss(ignore_index=IGNORE_INDEX, reduction="none")
-    token_losses = loss_fct(logits.reshape(-1, logits.size(-1)), labels.reshape(-1)).view_as(labels)
+    token_losses = loss_fct(
+        logits.reshape(-1, logits.size(-1)), labels.reshape(-1)
+    ).view_as(labels)
     answer_mask = labels.ne(IGNORE_INDEX)
     nll = token_losses[answer_mask].sum().item()
     return -nll
@@ -773,7 +1055,9 @@ def classify_example(
     best_choice = None
     best_score = None
     for choice in ordered_choices:
-        score = score_candidate_answer(model, tokenizer, device, dtype, architecture, prompt, choice)
+        score = score_candidate_answer(
+            model, tokenizer, device, dtype, architecture, prompt, choice
+        )
         if best_score is None or score > best_score:
             best_score = score
             best_choice = choice
@@ -789,6 +1073,90 @@ def canonical_choices(task: str, example: dict) -> list[str]:
 def gold_answer(task: str, example: dict) -> str:
     _, answer, _ = PROMPT_BUILDERS[task](example)
     return answer
+
+
+@torch.no_grad()
+def classify_judge_pairwise(
+    model: nn.Module,
+    tokenizer: AutoTokenizer,
+    device: torch.device,
+    dtype: torch.dtype,
+    architecture: str,
+    prompt: Sequence[TextSpan | SetSpan],
+) -> str:
+    best_label = "Tie"
+    best_score = None
+    for label in JUDGE_LABELS:
+        score = score_candidate_answer(
+            model,
+            tokenizer,
+            device,
+            dtype,
+            architecture,
+            prompt,
+            label,
+        )
+        if best_score is None or score > best_score:
+            best_score = score
+            best_label = label
+    return best_label
+
+
+@torch.no_grad()
+def evaluate_judge_pairwise(
+    *,
+    model: nn.Module,
+    tokenizer: AutoTokenizer,
+    dataset: Dataset,
+    args: argparse.Namespace,
+) -> dict[str, float]:
+    device = get_device()
+    dtype = torch.float32 if args.fp32_eval else get_dtype(args, train=False)
+    model.to(device=device, dtype=dtype)
+    model.eval()
+
+    total = 0
+    accuracy = 0.0
+    swap_consistency = 0.0
+    first_position_wins = 0.0
+    swapped_first_position_wins = 0.0
+
+    for row in dataset:
+        prompt_default, gold = prompt_for_judge_pairwise(row, swap=False)
+        prompt_swapped, swapped_gold = prompt_for_judge_pairwise(row, swap=True)
+
+        pred = classify_judge_pairwise(
+            model,
+            tokenizer,
+            device,
+            dtype,
+            args.architecture,
+            prompt_default,
+        )
+        pred_swapped = classify_judge_pairwise(
+            model,
+            tokenizer,
+            device,
+            dtype,
+            args.architecture,
+            prompt_swapped,
+        )
+
+        total += 1
+        accuracy += 1.0 if pred == gold else 0.0
+        swap_consistency += 1.0 if pred_swapped == swap_judge_label(pred) else 0.0
+        first_position_wins += 1.0 if pred == "A" else 0.0
+        swapped_first_position_wins += 1.0 if pred_swapped == "A" else 0.0
+
+        _ = swapped_gold
+
+    return {
+        "accuracy": accuracy / total,
+        "swap_consistency": swap_consistency / total,
+        "first_position_win_rate": first_position_wins / total,
+        "swapped_first_position_win_rate": swapped_first_position_wins / total,
+        "num_examples": total,
+    }
 
 
 @torch.no_grad()
@@ -818,7 +1186,9 @@ def evaluate(
         predictions = []
         gold = gold_answer(task, row)
         for perm in perms:
-            pred = classify_example(model, tokenizer, device, dtype, args.architecture, task, row, perm)
+            pred = classify_example(
+                model, tokenizer, device, dtype, args.architecture, task, row, perm
+            )
             predictions.append(pred == gold)
 
         random_hits += sum(predictions) / len(predictions)
@@ -832,6 +1202,30 @@ def evaluate(
     }
 
 
+def evaluate_task(
+    *,
+    model: nn.Module,
+    tokenizer: AutoTokenizer,
+    dataset: Dataset,
+    task: str,
+    args: argparse.Namespace,
+) -> dict[str, float]:
+    if task == "judge_pairwise":
+        return evaluate_judge_pairwise(
+            model=model,
+            tokenizer=tokenizer,
+            dataset=dataset,
+            args=args,
+        )
+    return evaluate(
+        model=model,
+        tokenizer=tokenizer,
+        dataset=dataset,
+        task=task,
+        args=args,
+    )
+
+
 def evaluate_with_separate_model(
     *,
     training_model: nn.Module,
@@ -842,7 +1236,7 @@ def evaluate_with_separate_model(
     output_dir: Path,
 ) -> dict[str, float]:
     if not args.do_train:
-        return evaluate(
+        return evaluate_task(
             model=training_model,
             tokenizer=tokenizer,
             dataset=dataset,
@@ -854,9 +1248,11 @@ def evaluate_with_separate_model(
         adapter_dir = Path(tmpdir)
         training_model.save_pretrained(adapter_dir)
         eval_model, eval_tokenizer = load_model_and_tokenizer(args, train=False)
-        eval_model = PeftModel.from_pretrained(eval_model, adapter_dir, is_trainable=False)
+        eval_model = PeftModel.from_pretrained(
+            eval_model, adapter_dir, is_trainable=False
+        )
         eval_model.config.use_cache = False
-        metrics = evaluate(
+        metrics = evaluate_task(
             model=eval_model,
             tokenizer=eval_tokenizer,
             dataset=dataset,
@@ -879,13 +1275,15 @@ def main() -> None:
 
     try:
         model, tokenizer = load_model_and_tokenizer(args, train=args.do_train)
-        train_ds, eval_ds = load_benchmark_dataset(args.task)
+        train_ds, eval_ds = load_task_datasets(args)
 
         train_ds = select_rows(train_ds, args.max_train_samples, args.seed)
         eval_ds = select_rows(eval_ds, args.max_eval_samples, args.seed)
 
         if args.do_train and args.cleaned_ultra_jsonl:
-            ultra_ds = load_cleaned_ultra(args.cleaned_ultra_jsonl, args.extra_pretrain_samples)
+            ultra_ds = load_cleaned_ultra(
+                args.cleaned_ultra_jsonl, args.extra_pretrain_samples
+            )
             train_stage(
                 model=model,
                 tokenizer=tokenizer,
@@ -895,6 +1293,7 @@ def main() -> None:
                     row["instruction"],
                     row["answer"],
                     args.architecture,
+                    args.max_seq_len,
                 ),
                 args=args,
                 stage_name="ultra-pretrain",
@@ -903,11 +1302,27 @@ def main() -> None:
             )
 
         if args.do_train:
+            if args.task == "judge_pairwise":
+                encode_fn = lambda row: encode_judge_example(
+                    tokenizer,
+                    row,
+                    args.architecture,
+                    args.max_seq_len,
+                    swap=bool(row.get("__swap__", False)),
+                )
+            else:
+                encode_fn = lambda row: encode_benchmark_example(
+                    tokenizer, args.task, row, args.architecture, args.max_seq_len
+                )
             train_stage(
                 model=model,
                 tokenizer=tokenizer,
-                dataset=train_ds,
-                encode_fn=lambda row: encode_benchmark_example(tokenizer, args.task, row, args.architecture),
+                dataset=(
+                    augment_judge_pairwise_dataset(train_ds)
+                    if args.task == "judge_pairwise"
+                    else train_ds
+                ),
+                encode_fn=encode_fn,
                 args=args,
                 stage_name=f"{args.task}-finetune",
                 output_dir=output_dir,
@@ -931,9 +1346,10 @@ def main() -> None:
             wandb_log(
                 wandb_run,
                 {
-                    f"{args.task}/random_order_accuracy": metrics["random_order_accuracy"],
-                    f"{args.task}/adversarial_order_accuracy": metrics["adversarial_order_accuracy"],
-                    f"{args.task}/num_examples": int(metrics["num_examples"]),
+                    f"{args.task}/{key}": (
+                        int(value) if key == "num_examples" else value
+                    )
+                    for key, value in metrics.items()
                 },
             )
     finally:

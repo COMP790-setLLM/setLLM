@@ -1,0 +1,2 @@
+{"prompt":"Summarize what photosynthesis does.","response_a":"Photosynthesis lets plants use sunlight, water, and carbon dioxide to make sugars and release oxygen.","response_b":"Plants eat dirt to get energy.","label":"A"}
+{"prompt":"Give a one-sentence answer: what is the capital of France?","response_a":"Paris is the capital of France.","response_b":"The capital of France is Paris.","label":"Tie"}

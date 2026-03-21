@@ -6,7 +6,9 @@ described in the paper:
 
 - Set Position Encoding (`SetPE`)
 - Set Attention Masking (`SetMask`)
+- Set-causal masking (`setcausal`) for long set elements in judge prompts
 - Paper-style prompts for `PIQA`, `ARC-Challenge`, `CommonsenseQA`, and `SIQA`
+- Pairwise `LLM-as-a-judge` prompts with JSONL inputs
 - LoRA finetuning for decoder-only Hugging Face models
 - Permutation-based evaluation for random-order and adversarial-order accuracy
 
@@ -43,6 +45,10 @@ python /root/setLLM/reproduce_setllm.py \
   --fp32-eval
 ```
 
+For judge-task work, it is often easier to download the gated model once to local
+storage and then point `--model` at the downloaded directory, for example
+`/workspace/models/gemma-2b`.
+
 ## Finetune On A Benchmark
 
 Example with Gemma 2B on ARC:
@@ -73,6 +79,117 @@ python reproduce_setllm.py \
   --bf16 \
   --fp32-eval
 ```
+
+To run the long-element ablation with the proposed set-causal mask, use:
+
+```bash
+source .venv/bin/activate
+python reproduce_setllm.py \
+  --architecture setcausal \
+  --model /workspace/models/gemma-2b \
+  --task arc \
+  --output-dir artifacts/gemma-2b-arc-setcausal \
+  --do-train \
+  --do-eval \
+  --bf16 \
+  --fp32-eval
+```
+
+## Pairwise Judge Task
+
+The script now supports an initial pairwise `LLM-as-a-judge` path for research on
+open-ended evaluation.
+
+Expected JSONL format:
+
+```json
+{"prompt":"...","response_a":"...","response_b":"...","label":"A"}
+```
+
+Supported labels are `A`, `B`, and `Tie`.
+
+Example smoke evaluation:
+
+```bash
+source .venv/bin/activate
+python reproduce_setllm.py \
+  --model /workspace/models/gemma-2b \
+  --task judge_pairwise \
+  --judge-train-jsonl data/judge_pairwise_toy_train.jsonl \
+  --judge-eval-jsonl data/judge_pairwise_toy_eval.jsonl \
+  --architecture setcausal \
+  --output-dir artifacts/gemma-2b-judge-toy-setcausal \
+  --do-eval \
+  --wandb-project setllm-smoke
+```
+
+For this task:
+
+- `--architecture vanilla` uses the base decoder causal mask.
+- `--architecture setllm` uses SetPE with the original SetMask prompt-side visibility.
+- `--architecture setcausal` uses SetPE with causal attention inside each response and
+  blocked attention across different candidate responses.
+
+Current pairwise metrics are:
+
+- `accuracy`
+- `swap_consistency`
+- `first_position_win_rate`
+- `swapped_first_position_win_rate`
+
+## Prepare MT-Bench Human Pairwise Data
+
+The repo now includes a helper to convert `lmsys/mt_bench_human_judgments` into the
+JSONL format expected by `--task judge_pairwise`.
+
+Example:
+
+```bash
+source .venv/bin/activate
+python prepare_judge_data.py \
+  --source mt_bench_human \
+  --split-name human \
+  --output-dir data/mt_bench_human_pairwise
+```
+
+This writes:
+
+- `data/mt_bench_human_pairwise/train.jsonl`
+- `data/mt_bench_human_pairwise/eval.jsonl`
+- `data/mt_bench_human_pairwise/stats.json`
+
+The split is question-based rather than row-based so the same MT-Bench question does not
+appear in both train and eval.
+
+## Judge Ablation Command
+
+For the first `vanilla` vs `setllm` vs `setcausal` judge ablation on a Vast machine:
+
+```bash
+source /venv/main/bin/activate
+export HF_HOME=/workspace/.cache/huggingface
+export WANDB_API_KEY=...
+cd /workspace/setLLM
+python prepare_judge_data.py \
+  --source mt_bench_human \
+  --split-name human \
+  --output-dir data/mt_bench_human_pairwise
+./scripts/run_judge_ablation_vast.sh \
+  /workspace/models/gemma-2b \
+  data/mt_bench_human_pairwise/train.jsonl \
+  data/mt_bench_human_pairwise/eval.jsonl \
+  /workspace/setLLM/artifacts/judge_ablation_gemma2b \
+  setllm-judge \
+  1024 \
+  100
+```
+
+The ablation script currently uses a memory-reduced smoke configuration for Gemma 2B on a
+32 GB class GPU:
+
+- `max_seq_len = 1024`
+- `gradient_accumulation_steps = 16`
+- `lora_r = 4`
 
 ## ARC Comparison Notes
 
