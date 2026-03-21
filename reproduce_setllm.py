@@ -125,12 +125,6 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Enable gradient checkpointing to reduce memory during training.",
     )
-    parser.add_argument(
-        "--max-seq-len",
-        type=int,
-        default=None,
-        help="Optional maximum total sequence length. If set, examples are left-truncated to fit.",
-    )
     parser.add_argument("--warmup-steps", type=int, default=300)
     parser.add_argument("--update-steps", type=int, default=3000)
     parser.add_argument("--weight-decay", type=float, default=0.0)
@@ -364,35 +358,6 @@ def append_response_tokens(
     )
 
 
-def truncate_encoded_example(
-    encoded: EncodedExample,
-    max_seq_len: int | None,
-) -> EncodedExample:
-    if max_seq_len is None or len(encoded.input_ids) <= max_seq_len:
-        return encoded
-    if max_seq_len <= 0:
-        raise ValueError("max_seq_len must be positive")
-
-    trim = len(encoded.input_ids) - max_seq_len
-    input_ids = encoded.input_ids[trim:]
-    labels = encoded.labels[trim:]
-    position_ids = encoded.position_ids[trim:]
-    set_ids = encoded.set_ids[trim:]
-    seq_ids = encoded.seq_ids[trim:]
-    prompt_length = max(0, encoded.prompt_length - trim)
-    if prompt_length == 0 and any(label != IGNORE_INDEX for label in labels):
-        prompt_length = 1
-    return EncodedExample(
-        input_ids=input_ids,
-        labels=labels,
-        position_ids=position_ids,
-        set_ids=set_ids,
-        seq_ids=seq_ids,
-        prompt_length=prompt_length,
-        metadata=encoded.metadata,
-    )
-
-
 def build_attention_pattern(
     prompt_length: int,
     seq_len: int,
@@ -623,7 +588,6 @@ def encode_benchmark_example(
     task: str,
     example: dict,
     architecture: str,
-    max_seq_len: int | None = None,
 ) -> EncodedExample:
     prompt_builder = PROMPT_BUILDERS[task]
     prompt, answer, ordered_choices = prompt_builder(example)
@@ -647,7 +611,7 @@ def encode_benchmark_example(
         "choices": ordered_choices,
         "task": task,
     }
-    return truncate_encoded_example(encoded, max_seq_len)
+    return encoded
 
 
 def encode_instruction_example(
@@ -655,7 +619,6 @@ def encode_instruction_example(
     instruction: str,
     answer: str,
     architecture: str,
-    max_seq_len: int | None = None,
 ) -> EncodedExample:
     prompt = [TextSpan(f"Question: {instruction.strip()}\n\nAnswer:\n")]
     prompt_ids, prompt_positions, prompt_set_ids, prompt_seq_ids = build_prompt_tokens(
@@ -674,7 +637,7 @@ def encode_instruction_example(
         add_eos=True,
     )
     encoded.metadata = {"instruction": instruction}
-    return truncate_encoded_example(encoded, max_seq_len)
+    return encoded
 
 
 def normalize_judge_label(label: str) -> str:
@@ -741,7 +704,6 @@ def encode_judge_example(
     tokenizer: AutoTokenizer,
     example: dict,
     architecture: str,
-    max_seq_len: int | None = None,
     *,
     swap: bool = False,
 ) -> EncodedExample:
@@ -766,7 +728,7 @@ def encode_judge_example(
         "label": label,
         "swapped": swap,
     }
-    return truncate_encoded_example(encoded, max_seq_len)
+    return encoded
 
 
 def select_rows(dataset: Dataset, limit: int | None, seed: int) -> Dataset:
@@ -1560,7 +1522,6 @@ def main() -> None:
                     row["instruction"],
                     row["answer"],
                     args.architecture,
-                    args.max_seq_len,
                 ),
                 args=args,
                 stage_name="ultra-pretrain",
@@ -1574,12 +1535,11 @@ def main() -> None:
                     tokenizer,
                     row,
                     args.architecture,
-                    args.max_seq_len,
                     swap=bool(row.get("__swap__", False)),
                 )
             else:
                 encode_fn = lambda row: encode_benchmark_example(
-                    tokenizer, args.task, row, args.architecture, args.max_seq_len
+                    tokenizer, args.task, row, args.architecture
                 )
             train_stage(
                 model=model,

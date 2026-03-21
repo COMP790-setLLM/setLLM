@@ -186,14 +186,12 @@ python prepare_judge_data.py \
   data/mt_bench_human_pairwise/eval.jsonl \
   /workspace/setLLM/artifacts/judge_ablation_gemma2b \
   setllm-judge \
-  1024 \
   100
 ```
 
 The ablation script currently uses a memory-reduced smoke configuration for Gemma 2B on a
 32 GB class GPU:
 
-- `max_seq_len = 1024`
 - `gradient_accumulation_steps = 16`
 - `lora_r = 4`
 

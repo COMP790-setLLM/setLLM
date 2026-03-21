@@ -346,6 +346,61 @@ Implementation note:
 - batched scoring must avoid passing `labels` through the model forward, otherwise Hugging Face computes the full training loss over the entire batched candidate set and can cause large, unnecessary memory spikes during eval
 - eval scoring now calls the model without `labels` and computes token NLL externally
 
+### 2026-03-21 Set-Causal Rerun After Local Updates
+
+- Reran the no-truncation, shuffled, swap-augmented `setcausal` pilot after syncing the latest local implementation changes.
+- W&B: `https://wandb.ai/ko-the-university-of-north-carolina-at-chapel-hill/setllm-judge/runs/b403hay8`
+- Config highlights:
+  - `max_train_samples = 64`
+  - `max_eval_samples = 32`
+  - `eval_batch_size = 2`
+  - `update_steps = 8`
+  - no truncation
+  - swap-augmented training
+
+Results:
+
+- `accuracy = 0.28125`
+- `swap_consistency = 0.0`
+- `first_position_win_rate = 0.28125`
+- `swapped_first_position_win_rate = 0.28125`
+
+Observation:
+
+- Under the current small-budget pilot, the updated local `setcausal` implementation still does not recover non-zero swap consistency.
+- This suggests the remaining issue is not just the earlier training-data bugs; it is likely either:
+  - the current `setcausal` masking logic still does not induce the intended behavior for pairwise judging, or
+  - the pilot budget is too small to reveal the effect.
+
+### 2026-03-21 Vanilla Finetuning Debug
+
+Zero-shot vanilla on the 32-example eval subset reached:
+
+- `accuracy = 0.34375`
+- `swap_consistency = 0.59375`
+
+This showed that our original vanilla finetuning recipe was hurting symmetry rather than helping it.
+
+Matched swap-augmented vanilla pilots:
+
+- `learning_rate = 1e-3` (earlier pilot)
+  - `accuracy = 0.34375`
+  - `swap_consistency = 0.125`
+- `learning_rate = 1e-4`
+  - W&B: `https://wandb.ai/ko-the-university-of-north-carolina-at-chapel-hill/setllm-judge/runs/kl14nizn`
+  - `accuracy = 0.40625`
+  - `swap_consistency = 0.28125`
+- `learning_rate = 5e-5`
+  - W&B: `https://wandb.ai/ko-the-university-of-north-carolina-at-chapel-hill/setllm-judge/runs/vizi9xai`
+  - `accuracy = 0.40625`
+  - `swap_consistency = 0.5`
+
+Current takeaway:
+
+- the finetuning instability is strongly learning-rate sensitive
+- lowering the learning rate from `1e-3` to `5e-5` substantially restores swap consistency while preserving or slightly improving accuracy
+- for vanilla judge finetuning, `5e-5` is currently the best configuration tested in this pilot regime
+
 ### 2026-03-21 Set-Causal Mask Correction
 
 - The original `setcausal` implementation was a hybrid prompt mask:

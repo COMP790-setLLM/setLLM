@@ -2,7 +2,7 @@
 set -euo pipefail
 
 if [[ $# -lt 5 ]]; then
-  echo "usage: $0 <model_path> <train_jsonl> <eval_jsonl> <output_root> <wandb_project> [max_seq_len] [update_steps]"
+  echo "usage: $0 <model_path> <train_jsonl> <eval_jsonl> <output_root> <wandb_project> [update_steps]"
   exit 1
 fi
 
@@ -11,8 +11,7 @@ TRAIN_JSONL="$2"
 EVAL_JSONL="$3"
 OUTPUT_ROOT="$4"
 WANDB_PROJECT="$5"
-MAX_SEQ_LEN="${6:-1024}"
-UPDATE_STEPS="${7:-100}"
+UPDATE_STEPS="${6:-100}"
 
 mkdir -p "$OUTPUT_ROOT"
 
@@ -28,7 +27,6 @@ for ARCH in vanilla setllm setcausal; do
     --do-eval \
     --batch-size 1 \
     --gradient-accumulation-steps 16 \
-    --max-seq-len "$MAX_SEQ_LEN" \
     --lora-r 4 \
     --lora-alpha 4 \
     --gradient-checkpointing \

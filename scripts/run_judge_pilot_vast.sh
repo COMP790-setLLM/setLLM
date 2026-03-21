@@ -25,7 +25,6 @@ python reproduce_setllm.py \
   --max-eval-samples 32 \
   --batch-size 1 \
   --gradient-accumulation-steps 16 \
-  --max-seq-len 768 \
   --lora-r 4 \
   --lora-alpha 4 \
   --gradient-checkpointing \
