@@ -15,7 +15,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--source",
-        choices=["mt_bench_human"],
+        choices=["mt_bench_human", "llmbar_natural", "faireval"],
         default="mt_bench_human",
         help="Source dataset to convert into pairwise judge JSONL.",
     )
@@ -34,6 +34,11 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.2,
         help="Fraction of unique question ids reserved for eval.",
+    )
+    parser.add_argument(
+        "--repo-root",
+        default=None,
+        help="Optional benchmark repo root for sources stored as local JSON files.",
     )
     parser.add_argument("--seed", type=int, default=42)
     return parser.parse_args()
@@ -93,31 +98,87 @@ def write_jsonl(path: Path, rows: list[dict]) -> None:
             handle.write(json.dumps(row) + "\n")
 
 
+def convert_local_pair_row(row: dict, *, source: str, index: int) -> dict:
+    label_value = row["label"]
+    if label_value not in (1, 2):
+        raise ValueError(f"Unsupported pairwise label: {label_value}")
+    return {
+        "prompt": row["input"].strip(),
+        "response_a": row["output_1"].strip(),
+        "response_b": row["output_2"].strip(),
+        "label": "A" if label_value == 1 else "B",
+        "question_id": f"{source}-{index}",
+        "source": source,
+    }
+
+
+def load_local_json_dataset(path: Path) -> list[dict]:
+    return json.loads(path.read_text())
+
+
+def build_row_split(
+    rows: list[dict], eval_fraction: float, seed: int
+) -> tuple[list[dict], list[dict]]:
+    indices = list(range(len(rows)))
+    rng = random.Random(seed)
+    rng.shuffle(indices)
+    eval_count = max(1, int(len(rows) * eval_fraction))
+    eval_indices = set(indices[:eval_count])
+    train_rows = [row for idx, row in enumerate(rows) if idx not in eval_indices]
+    eval_rows = [row for idx, row in enumerate(rows) if idx in eval_indices]
+    return train_rows, eval_rows
+
+
 def main() -> None:
     args = parse_args()
-    if args.source != "mt_bench_human":
-        raise RuntimeError(f"Unsupported source: {args.source}")
+    if args.source == "mt_bench_human":
+        dataset = load_dataset("lmsys/mt_bench_human_judgments", split=args.split_name)
+        converted = []
+        question_ids = sorted(set(dataset["question_id"]))
 
-    dataset = load_dataset("lmsys/mt_bench_human_judgments", split=args.split_name)
-    converted = []
-    question_ids = sorted(set(dataset["question_id"]))
+        rng = random.Random(args.seed)
+        rng.shuffle(question_ids)
+        eval_count = max(1, int(len(question_ids) * args.eval_question_fraction))
+        eval_question_ids = set(question_ids[:eval_count])
 
-    rng = random.Random(args.seed)
-    rng.shuffle(question_ids)
-    eval_count = max(1, int(len(question_ids) * args.eval_question_fraction))
-    eval_question_ids = set(question_ids[:eval_count])
+        train_rows = []
+        eval_rows = []
+        for row in dataset:
+            converted_row = convert_mt_bench_row(dict(row))
+            converted.append(converted_row)
+            target = (
+                eval_rows
+                if converted_row["question_id"] in eval_question_ids
+                else train_rows
+            )
+            target.append(converted_row)
+        num_unique_questions = len(question_ids)
+        num_eval_questions = len(eval_question_ids)
+    else:
+        if args.repo_root is None:
+            raise RuntimeError(f"{args.source} requires --repo-root")
+        repo_root = Path(args.repo_root)
+        if args.source == "llmbar_natural":
+            dataset_path = repo_root / "Dataset" / "LLMBar" / "Natural" / "dataset.json"
+            source_name = "princeton-nlp/LLMBar/Natural"
+        elif args.source == "faireval":
+            dataset_path = (
+                repo_root / "Dataset" / "Processed" / "FairEval" / "dataset.json"
+            )
+            source_name = "princeton-nlp/LLMBar/Processed/FairEval"
+        else:
+            raise RuntimeError(f"Unsupported source: {args.source}")
 
-    train_rows = []
-    eval_rows = []
-    for row in dataset:
-        converted_row = convert_mt_bench_row(dict(row))
-        converted.append(converted_row)
-        target = (
-            eval_rows
-            if converted_row["question_id"] in eval_question_ids
-            else train_rows
+        raw_rows = load_local_json_dataset(dataset_path)
+        converted = [
+            convert_local_pair_row(row, source=source_name, index=index)
+            for index, row in enumerate(raw_rows)
+        ]
+        train_rows, eval_rows = build_row_split(
+            converted, args.eval_question_fraction, args.seed
         )
-        target.append(converted_row)
+        num_unique_questions = len(converted)
+        num_eval_questions = len(eval_rows)
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -134,8 +195,8 @@ def main() -> None:
         "num_rows": len(converted),
         "num_train_rows": len(train_rows),
         "num_eval_rows": len(eval_rows),
-        "num_unique_questions": len(question_ids),
-        "num_eval_questions": len(eval_question_ids),
+        "num_unique_questions": num_unique_questions,
+        "num_eval_questions": num_eval_questions,
         "seed": args.seed,
     }
     stats_path.write_text(json.dumps(stats, indent=2) + "\n")

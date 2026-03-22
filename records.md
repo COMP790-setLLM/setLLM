@@ -401,6 +401,97 @@ Current takeaway:
 - lowering the learning rate from `1e-3` to `5e-5` substantially restores swap consistency while preserving or slightly improving accuracy
 - for vanilla judge finetuning, `5e-5` is currently the best configuration tested in this pilot regime
 
+### 2026-03-22 Stronger Vanilla Finetuning Check
+
+To test whether the `5e-5` result was only staying close to the original model, I ran longer no-truncation swap-augmented pilots.
+
+- `learning_rate = 5e-5`, `update_steps = 32`
+  - W&B: `https://wandb.ai/ko-the-university-of-north-carolina-at-chapel-hill/setllm-judge/runs/vbev3lre`
+  - `accuracy = 0.375`
+  - `swap_consistency = 0.21875`
+- `learning_rate = 2e-5`, `update_steps = 32`
+  - W&B: `https://wandb.ai/ko-the-university-of-north-carolina-at-chapel-hill/setllm-judge/runs/43l06d4b`
+  - `accuracy = 0.4375`
+  - `swap_consistency = 0.4375`
+
+Interpretation:
+
+- simply training longer at `5e-5` does not improve symmetry; it can make it worse
+- a smaller learning rate (`2e-5`) gives the best accuracy seen so far for vanilla finetuning in this pilot regime
+- however, even this stronger run still does not beat zero-shot vanilla on swap consistency (`0.59375`)
+- current best vanilla tradeoff in the tested settings is:
+  - zero-shot for raw consistency
+  - `2e-5`, 32 steps for best finetuned accuracy with moderate consistency
+
+### 2026-03-22 LLMBar and FairEval Benchmarks
+
+Prepared pairwise judge data on the Vast machine from a shallow clone of `princeton-nlp/LLMBar`:
+
+- `LLMBar Natural`
+  - source path: `/workspace/benchmarks/LLMBar/Dataset/LLMBar/Natural/dataset.json`
+  - converted rows: `100`
+  - train/eval split: `80 / 20`
+- `FairEval`
+  - source path: `/workspace/benchmarks/LLMBar/Dataset/Processed/FairEval/dataset.json`
+  - converted rows: `66`
+  - train/eval split: `53 / 13`
+
+Vanilla pilot configuration:
+
+- `learning_rate = 2e-5`
+- `update_steps = 32`
+- swap-augmented training
+- no truncation
+
+Results:
+
+- `LLMBar Natural`
+  - W&B: `https://wandb.ai/ko-the-university-of-north-carolina-at-chapel-hill/setllm-judge/runs/ow0gdev3`
+  - `accuracy = 0.25`
+  - `swap_consistency = 0.0`
+  - `first_position_win_rate = 1.0`
+  - `swapped_first_position_win_rate = 1.0`
+- `FairEval`
+  - W&B: `https://wandb.ai/ko-the-university-of-north-carolina-at-chapel-hill/setllm-judge/runs/3uuwm330`
+  - `accuracy = 0.23077`
+  - `swap_consistency = 0.23077`
+  - `first_position_win_rate = 0.61538`
+  - `swapped_first_position_win_rate = 0.76923`
+
+Observation:
+
+- The current vanilla finetuning recipe transfers poorly to these benchmarks.
+- `LLMBar Natural` shows a severe collapse to always-first-choice behavior in this pilot.
+- `FairEval` is also weak, though not as completely collapsed.
+- These results suggest that benchmark-specific tuning or a different supervision setup is needed before drawing conclusions across judge datasets.
+
+### 2026-03-22 Zero-Shot Vanilla on LLMBar and FairEval
+
+To check whether finetuning was helping or hurting on these benchmarks, I also ran zero-shot vanilla evaluations.
+
+- `LLMBar Natural`
+  - W&B: `https://wandb.ai/ko-the-university-of-north-carolina-at-chapel-hill/setllm-judge/runs/bprpv43n`
+  - `accuracy = 0.2`
+  - `swap_consistency = 0.25`
+  - `first_position_win_rate = 0.7`
+  - `swapped_first_position_win_rate = 0.75`
+- `FairEval`
+  - W&B: `https://wandb.ai/ko-the-university-of-north-carolina-at-chapel-hill/setllm-judge/runs/dwsi4ok5`
+  - `accuracy = 0.30769`
+  - `swap_consistency = 0.38462`
+  - `first_position_win_rate = 0.61538`
+  - `swapped_first_position_win_rate = 0.61538`
+
+Comparison with the finetuned vanilla pilots:
+
+- `LLMBar Natural`: zero-shot swap consistency `0.25` vs finetuned `0.0`
+- `FairEval`: zero-shot swap consistency `0.38462` vs finetuned `0.23077`
+
+Takeaway:
+
+- the current vanilla finetuning setup is again hurting swap consistency on both benchmarks
+- this is the same failure pattern observed on MT-Bench and suggests a broader issue with the current training objective or recipe rather than a dataset-specific problem
+
 ### 2026-03-21 Set-Causal Mask Correction
 
 - The original `setcausal` implementation was a hybrid prompt mask:
