@@ -740,12 +740,13 @@ def select_rows(dataset: Dataset, limit: int | None, seed: int) -> Dataset:
 
 def load_benchmark_dataset(task: str) -> tuple[Dataset, Dataset]:
     path, subset, train_split, eval_split = HF_DATASETS[task]
+    load_kwargs = {"trust_remote_code": True}
     if subset is None:
-        train = load_dataset(path, split=train_split)
-        eval_ds = load_dataset(path, split=eval_split)
+        train = load_dataset(path, split=train_split, **load_kwargs)
+        eval_ds = load_dataset(path, split=eval_split, **load_kwargs)
     else:
-        train = load_dataset(path, subset, split=train_split)
-        eval_ds = load_dataset(path, subset, split=eval_split)
+        train = load_dataset(path, subset, split=train_split, **load_kwargs)
+        eval_ds = load_dataset(path, subset, split=eval_split, **load_kwargs)
     return train, eval_ds
 
 
