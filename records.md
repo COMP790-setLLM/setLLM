@@ -506,3 +506,32 @@ Takeaway:
 - Important result-tracking note:
   - all earlier `setcausal` runs recorded above used the pre-fix hybrid mask
   - those numbers are therefore not directly comparable to future runs with the corrected implementation
+
+## 2026-03-24
+
+### Paper Interpretation: Vanilla Finetuning Can Worsen Order Sensitivity
+
+- For the judge setting, a working hypothesis is now explicitly recorded:
+  - vanilla finetuning can improve in-distribution accuracy while making swap consistency worse
+  - this is consistent with the Set-LLM paper rather than a contradiction to it
+- Mechanistic interpretation:
+  - vanilla training can strengthen positional shortcuts when supervision is mostly seen in a canonical order
+  - in pairwise judge data, this means the model can become more sensitive to whether a response appears in slot `A` or `B`
+
+### Paper Evidence from ARC
+
+- The paper shows this pattern clearly for vanilla Gemma 2B on `ARC` with modified prompts:
+  - pretrained `Causal Mask+PE`: `36.03` random vs `17.68` adversarial
+  - finetuned `Causal Mask+PE`: `55.20` random vs `23.72` adversarial
+- Interpretation:
+  - vanilla finetuning improves absolute accuracy
+  - but the random-to-adversarial gap becomes much larger after finetuning
+  - this supports the observation that vanilla judge finetuning on `MT-Bench` can reduce swap consistency
+
+### Broader Research Takeaway
+
+- For pairwise judge experiments, worsening swap consistency after vanilla finetuning should be treated as an expected failure mode, not just a bug signal.
+- This strengthens the motivation for:
+  - swap augmentation
+  - explicit order randomization
+  - permutation-invariant architectural changes like `SetPE` / `SetMask`
