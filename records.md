@@ -218,6 +218,7 @@ Same fast pilot config as before, but with no `max_seq_len` limit.
   - first_position_win_rate: `1.0`
   - swapped_first_position_win_rate: `1.0`
 - `setllm`
+
   - W&B: `https://wandb.ai/ko-the-university-of-north-carolina-at-chapel-hill/setllm-judge/runs/0wdb8riq`
   - accuracy: `0.5`
   - swap_consistency: `0.125`
@@ -323,29 +324,6 @@ Fix applied:
 - judge training now augments each pairwise example with a swapped-order copy and the correspondingly swapped label
 
 ### 2026-03-21 Eval Optimization
-
-The pairwise judge eval loop was spending most of its time rebuilding prompt encodings and running three separate forwards for `A`, `B`, and `Tie` for every prompt.
-
-Optimization applied in `reproduce_setllm.py`:
-
-- added reusable `PromptTokens` bundles
-- cache prompt tokenization per prompt during eval
-- batch `A`, `B`, and `Tie` scoring into a single forward pass instead of three separate forwards
-- reuse the same prompt-token bundle for the default and swapped prompt scoring path
-- batch multiple judge prompts together during eval with `--eval-batch-size`
-- cache prompt-side attention patterns and only extend them for response tokens
-
-Expected effect:
-
-- lower Python overhead
-- fewer attention mask constructions
-- better GPU utilization during judge eval
-
-Implementation note:
-
-- batched scoring must avoid passing `labels` through the model forward, otherwise Hugging Face computes the full training loss over the entire batched candidate set and can cause large, unnecessary memory spikes during eval
-- eval scoring now calls the model without `labels` and computes token NLL externally
-
 ### 2026-03-21 Set-Causal Rerun After Local Updates
 
 - Reran the no-truncation, shuffled, swap-augmented `setcausal` pilot after syncing the latest local implementation changes.
@@ -506,3 +484,140 @@ Takeaway:
 - Important result-tracking note:
   - all earlier `setcausal` runs recorded above used the pre-fix hybrid mask
   - those numbers are therefore not directly comparable to future runs with the corrected implementation
+## 2026-03-26
+
+### MCQ Reproduction: `setcausal` vs `setllm`
+
+- Re-ran the MCQ reproduction on remote machine `ssh -p 21551 root@79.112.2.29` with W&B logging, switching from `setllm` to `setcausal`.
+- Used the same memory-aware launch recipe that worked for the earlier `setllm` runs:
+  - `ARC`: `batch_size = 5`
+  - `CSQA`: `batch_size = 5`
+  - `PIQA`: `batch_size = 1`, `gradient_checkpointing = true`
+- Final `setllm` reproduction metrics for comparison:
+  - `ARC`: `56.52 / 56.52`
+  - `CSQA`: `76.90 / 76.90`
+  - `PIQA`: `85.20 / 85.20`
+- Final `setcausal` metrics:
+  - `ARC`: `51.51 / 51.51`
+  - `CSQA`: `75.27 / 75.27`
+  - `PIQA`: `81.01 / 81.01`
+- Format above is `random_order_accuracy / adversarial_order_accuracy`.
+- Main observation: `setcausal` preserved invariance, but underperformed `setllm` on all three MCQ benchmarks.
+
+### Interpretation of `setcausal` Underperformance on MCQ
+
+- Working hypothesis: in this repo, `setcausal` is a stricter and weaker prompt encoder than paper-style `setllm` for MCQ.
+- `setllm` allows prompt-side bidirectional visibility within an allowed region while blocking cross-element attention.
+- `setcausal` keeps prompt attention causal everywhere and also blocks cross-element attention.
+- This means tokens inside a choice cannot use future tokens from the same choice during prompt encoding.
+- For MCQ, this appears harmful because each choice is already fully present in the prompt and full within-choice context is useful.
+- In this implementation, training and evaluation score the full answer string rather than only an option label, so prompt representation quality matters directly.
+- Likely result: `setcausal` keeps the isolation benefit but gives up the richer within-choice encoding that helps `setllm`.
+
+### Within-Choice Masking Discussion
+
+- For MCQ, the important masking requirement is across choices, not within a choice.
+- A choice is still an ordered sequence, so preserving its internal order and allowing bidirectional within-choice context is usually helpful.
+- Conclusion from discussion:
+  - within-choice causal masking is usually unnecessary and often harmful for MCQ
+  - cross-choice masking is the important ingredient for invariance
+
+### Why Causal Mask Still Matters in Standard Prefill
+
+- In a standard decoder LM, causal masking still matters during prefill even when all prompt tokens are already known.
+- Removing the causal mask changes prompt hidden states because earlier prompt tokens can now read future prompt tokens.
+- Those changed hidden states change next-token logits, so this is not a harmless implementation detail.
+- Decoder-only pretraining assumes causal masking over a single token stream, so causal prefill preserves the original computation pattern.
+
+### Bitune Connection and Prompt/Response Structure
+
+- Read `Bitune: Bidirectional Instruction-Tuning` (`arXiv:2405.14862`) via ar5iv.
+- Main relevant idea: in instruction tuning, the answer is conditioned on the whole prompt, so prompt encoding does not need to be purely causal.
+- Bitune does two prompt passes:
+  - one causal
+  - one bidirectional
+- It then mixes those prompt features before standard causal decoding.
+- This does not imply that pure encoder models are simply better overall.
+- Better framing: for the prefilling / prompt-encoding phase, more encoder-like or prefix-style processing can be better than strict causal prompt encoding, while decoding still remains causal.
+
+### Why Mainstream SOTA Usually Still Uses Causal Prefill
+
+- Decoder-only pretraining does not usually have a clean prompt/response separation; it operates on a single token stream with next-token prediction.
+- Because of that, causal masking is the natural and universal training rule during pretraining.
+- Decoder-only stacks also won on simplicity, scaling, tooling, and serving infrastructure.
+- So the relevant conclusion is not that encoder models are better, but that once a task has a clear prompt/response boundary, non-causal prompt prefill becomes much more reasonable.
+- This is especially relevant for judge tasks, because the candidate responses are fully known at prefill time.
+
+### KV Cache Note
+
+- We clarified that KV cache is still compatible with non-causal prompt prefill as long as the prompt-side computation is frozen before decoding.
+- Valid pattern:
+  - process the full known prompt with a special prompt mask
+  - cache the resulting prompt `K/V`
+  - decode response tokens causally using the cached prompt features
+- KV caching would break only if prompt states depended on future generated response tokens and therefore had to be recomputed after each new token.
+
+### Judge Benchmark Discussion
+
+- Existing project targets remain:
+  - `MT-Bench`
+  - `LLMBar`
+  - `FairEval`
+  - `Chatbot Arena`
+- Additional benchmark ideas found during discussion / web search:
+  - `JudgeBench`
+  - `Arena-Hard-Auto`
+  - `AlpacaEval 2.0`
+  - `UltraFeedback`
+  - `CodeUltraFeedback`
+  - `RewardBench`
+  - `FLASK`
+- Best shortlist for evaluating `setcausal` as a judge:
+  - `JudgeBench`
+  - `Arena-Hard-Auto`
+  - `UltraFeedback`
+  - `AlpacaEval 2.0`
+  - `FLASK`
+
+### How Set-LLM Uses UltraFeedback
+
+- The Set-LLM paper does not use UltraFeedback as the final benchmark.
+- Instead, it uses a cleaned subset of about `10k` UltraFeedback examples as an additional pretraining / instruction-tuning stage before benchmark-specific finetuning.
+- This stage is meant to help models adapt to the new masking and positional encoding setup.
+- Then the models are finetuned separately on each target benchmark.
+- The paper cites preprocessing inspired by `Bitune`, but does not release the exact cleaned subset.
+
+### Current Research Takeaway
+
+- `setcausal` remains plausible as a judge-side ablation because it blocks cross-response leakage while staying closer to decoder-style causality.
+- However, the MCQ results suggest it may over-constrain prompt encoding and lose useful within-element context.
+- Bitune strengthens the hypothesis that richer prompt-side encoding can help once prompt/response structure is explicit.
+- For judge tasks, the next meaningful comparison is likely:
+  - `vanilla`
+  - paper-style `setllm`
+  - `setcausal`
+  - potentially a Bitune-like hybrid prompt encoder
+
+The pairwise judge eval loop was spending most of its time rebuilding prompt encodings and running three separate forwards for `A`, `B`, and `Tie` for every prompt.
+
+Optimization applied in `reproduce_setllm.py`:
+
+- added reusable `PromptTokens` bundles
+- cache prompt tokenization per prompt during eval
+- batch `A`, `B`, and `Tie` scoring into a single forward pass instead of three separate forwards
+- reuse the same prompt-token bundle for the default and swapped prompt scoring path
+- batch multiple judge prompts together during eval with `--eval-batch-size`
+- cache prompt-side attention patterns and only extend them for response tokens
+
+Expected effect:
+
+- lower Python overhead
+- fewer attention mask constructions
+- better GPU utilization during judge eval
+
+Implementation note:
+
+- batched scoring must avoid passing `labels` through the model forward, otherwise Hugging Face computes the full training loss over the entire batched candidate set and can cause large, unnecessary memory spikes during eval
+- eval scoring now calls the model without `labels` and computes token NLL externally
+
+
