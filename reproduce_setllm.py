@@ -41,7 +41,7 @@ from transformers import (
 
 
 IGNORE_INDEX = -100
-JUDGE_LABELS = ("A", "B", "Tie")
+JUDGE_LABELS = ("A7", "A8", "Tie")
 
 
 @dataclass
@@ -171,6 +171,15 @@ def parse_args() -> argparse.Namespace:
         help=(
             "JSONL for pairwise judge evaluation with rows like "
             "{'prompt': ..., 'response_a': ..., 'response_b': ..., 'label': 'A'|'B'|'Tie'}"
+        ),
+    )
+    parser.add_argument(
+        "--judge-swap-mode",
+        choices=["permute_elements", "swap_labels_and_answers"],
+        default="permute_elements",
+        help=(
+            "How to build swapped judge prompts: either permute the two set elements "
+            "as a whole, or swap the response contents while keeping the A/B element order fixed."
         ),
     )
     return parser.parse_args()
@@ -365,29 +374,28 @@ def build_attention_pattern(
     seq_ids: Sequence[int],
     architecture: str,
 ) -> torch.Tensor:
-    allowed = torch.zeros((seq_len, seq_len), dtype=torch.bool)
+    query_indices = torch.arange(seq_len)
+    key_indices = torch.arange(seq_len)
+    query_grid = query_indices.unsqueeze(1)
+    key_grid = key_indices.unsqueeze(0)
 
-    for query_idx in range(seq_len):
-        for key_idx in range(seq_len):
-            if query_idx < prompt_length:
-                if architecture == "setcausal" and key_idx > query_idx:
-                    continue
-                if key_idx >= prompt_length:
-                    continue
-                same_set = (
-                    set_ids[query_idx] >= 0 and set_ids[query_idx] == set_ids[key_idx]
-                )
-                different_element = seq_ids[query_idx] != seq_ids[key_idx]
-                if same_set and different_element:
-                    allowed[query_idx, key_idx] = False
-                    continue
-                allowed[query_idx, key_idx] = True
-                continue
+    allowed = (key_grid < prompt_length) | (key_grid <= query_grid)
+    prompt_queries = query_grid < prompt_length
+    prompt_keys = key_grid < prompt_length
 
-            # Prefix-style prompt attention + causal attention over response.
-            allowed[query_idx, key_idx] = (
-                key_idx < prompt_length or key_idx <= query_idx
-            )
+    allowed &= (~prompt_queries) | prompt_keys
+
+    if architecture == "setcausal":
+        allowed &= (~prompt_queries) | (key_grid <= query_grid)
+
+    set_ids_tensor = torch.tensor(set_ids, dtype=torch.long)
+    seq_ids_tensor = torch.tensor(seq_ids, dtype=torch.long)
+    same_set = (set_ids_tensor.unsqueeze(1) >= 0) & (
+        set_ids_tensor.unsqueeze(1) == set_ids_tensor.unsqueeze(0)
+    )
+    different_element = seq_ids_tensor.unsqueeze(1) != seq_ids_tensor.unsqueeze(0)
+    cross_element_prompt_block = prompt_queries & same_set & different_element
+    allowed &= ~cross_element_prompt_block
 
     return allowed
 
@@ -408,9 +416,13 @@ def extend_prompt_attention_pattern(
 
     pattern = torch.zeros((seq_len, seq_len), dtype=torch.bool)
     pattern[:prompt_length, :prompt_length] = prompt_tokens.prompt_pattern
-    for query_idx in range(prompt_length, seq_len):
-        pattern[query_idx, :prompt_length] = True
-        pattern[query_idx, prompt_length : query_idx + 1] = True
+    if response_length:
+        response_query_indices = torch.arange(prompt_length, seq_len)
+        key_indices = torch.arange(seq_len)
+        response_mask = (key_indices.unsqueeze(0) < prompt_length) | (
+            key_indices.unsqueeze(0) <= response_query_indices.unsqueeze(1)
+        )
+        pattern[prompt_length:, :] = response_mask
     return pattern
 
 
@@ -643,14 +655,22 @@ def encode_instruction_example(
 def normalize_judge_label(label: str) -> str:
     value = label.strip().lower()
     mapping = {
-        "a": "A",
-        "assistant a": "A",
-        "model a": "A",
-        "response a": "A",
-        "b": "B",
-        "assistant b": "B",
-        "model b": "B",
-        "response b": "B",
+        "a": "A7",
+        "a7": "A7",
+        "assistant a": "A7",
+        "assistant a7": "A7",
+        "model a": "A7",
+        "model a7": "A7",
+        "response a": "A7",
+        "response a7": "A7",
+        "b": "A8",
+        "a8": "A8",
+        "assistant b": "A8",
+        "assistant a8": "A8",
+        "model b": "A8",
+        "model a8": "A8",
+        "response b": "A8",
+        "response a8": "A8",
         "tie": "Tie",
         "draw": "Tie",
         "equal": "Tie",
@@ -662,10 +682,10 @@ def normalize_judge_label(label: str) -> str:
 
 def swap_judge_label(label: str) -> str:
     normalized = normalize_judge_label(label)
-    if normalized == "A":
-        return "B"
-    if normalized == "B":
-        return "A"
+    if normalized == "A7":
+        return "A8"
+    if normalized == "A8":
+        return "A7"
     return normalized
 
 
@@ -673,28 +693,36 @@ def prompt_for_judge_pairwise(
     example: dict,
     *,
     swap: bool = False,
+    swap_mode: str = "permute_elements",
 ) -> tuple[MixedPrompt, str]:
     response_a = example["response_a"].strip()
     response_b = example["response_b"].strip()
     label = normalize_judge_label(example["label"])
+    elements = [
+        f"[Response A7]\n{response_a}\n",
+        f"[Response A8]\n{response_b}\n",
+    ]
     if swap:
-        response_a, response_b = response_b, response_a
-        label = swap_judge_label(label)
+        if swap_mode == "permute_elements":
+            elements = list(reversed(elements))
+        elif swap_mode == "swap_labels_and_answers":
+            response_a, response_b = response_b, response_a
+            elements = [
+                f"[Response A7]\n{response_a}\n",
+                f"[Response A8]\n{response_b}\n",
+            ]
+        else:
+            raise ValueError(f"Unsupported judge swap mode: {swap_mode}")
 
     prompt: MixedPrompt = [
         TextSpan(
             "You are an impartial judge evaluating the quality of two assistant responses.\n"
             "Consider helpfulness, correctness, completeness, and instruction following.\n"
-            "Return exactly one label: A, B, or Tie.\n\n"
+            "Return exactly one label: A7, A8, or Tie.\n\n"
             f"User prompt:\n{example['prompt'].strip()}\n\n"
             "Candidate responses:\n"
         ),
-        SetSpan(
-            [
-                f"[Response A]\n{response_a}\n",
-                f"[Response B]\n{response_b}\n",
-            ]
-        ),
+        SetSpan(elements),
         TextSpan("\nJudgment:\n"),
     ]
     return prompt, label
@@ -706,9 +734,14 @@ def encode_judge_example(
     architecture: str,
     *,
     swap: bool = False,
+    swap_mode: str = "permute_elements",
 ) -> EncodedExample:
-    prompt, label = prompt_for_judge_pairwise(example, swap=swap)
-    prompt_ids, prompt_positions, prompt_set_ids, prompt_seq_ids = build_prompt_tokens(
+    prompt, label = prompt_for_judge_pairwise(
+        example,
+        swap=swap,
+        swap_mode=swap_mode,
+    )
+    prompt_tokens = build_prompt_token_bundle(
         tokenizer,
         prompt,
         add_bos=True,
@@ -716,14 +749,21 @@ def encode_judge_example(
     )
     encoded = append_response_tokens(
         tokenizer,
-        prompt_ids=prompt_ids,
-        prompt_position_ids=prompt_positions,
-        prompt_set_ids=prompt_set_ids,
-        prompt_seq_ids=prompt_seq_ids,
+        prompt_ids=prompt_tokens.input_ids,
+        prompt_position_ids=prompt_tokens.position_ids,
+        prompt_set_ids=prompt_tokens.set_ids,
+        prompt_seq_ids=prompt_tokens.seq_ids,
         response_text=label,
         add_eos=True,
     )
+    if architecture != "vanilla":
+        encoded.metadata["attention_pattern"] = extend_prompt_attention_pattern(
+            prompt_tokens,
+            len(encoded.input_ids) - encoded.prompt_length,
+            architecture,
+        )
     encoded.metadata = {
+        **encoded.metadata,
         "task": "judge_pairwise",
         "label": label,
         "swapped": swap,
@@ -1166,48 +1206,17 @@ def classify_judge_pairwise_batch_from_tokens(
     architecture: str,
     prompt_tokens_batch: Sequence[PromptTokens],
 ) -> list[str]:
-    encoded_batch = []
-    for prompt_tokens in prompt_tokens_batch:
-        for label in JUDGE_LABELS:
-            encoded = append_response_tokens(
-                tokenizer,
-                prompt_ids=prompt_tokens.input_ids,
-                prompt_position_ids=prompt_tokens.position_ids,
-                prompt_set_ids=prompt_tokens.set_ids,
-                prompt_seq_ids=prompt_tokens.seq_ids,
-                response_text=label,
-                add_eos=True,
-            )
-            if architecture != "vanilla":
-                encoded.metadata["attention_pattern"] = extend_prompt_attention_pattern(
-                    prompt_tokens,
-                    len(encoded.input_ids) - encoded.prompt_length,
-                    architecture,
-                )
-            encoded_batch.append(encoded)
-
-    model_inputs = batch_to_model_inputs(
-        encoded_batch, tokenizer, device, dtype, architecture
-    )
-    logits = forward_for_scoring(model, model_inputs)[:, :-1, :]
-    labels = model_inputs["labels"][:, 1:]
-    loss_fct = nn.CrossEntropyLoss(ignore_index=IGNORE_INDEX, reduction="none")
-    token_losses = loss_fct(
-        logits.reshape(-1, logits.size(-1)), labels.reshape(-1)
-    ).view_as(labels)
-
-    all_scores = []
-    for batch_index in range(labels.size(0)):
-        answer_mask = labels[batch_index].ne(IGNORE_INDEX)
-        nll = token_losses[batch_index][answer_mask].sum().item()
-        all_scores.append(-nll)
-
-    predictions = []
-    for start in range(0, len(all_scores), len(JUDGE_LABELS)):
-        group = all_scores[start : start + len(JUDGE_LABELS)]
-        best_index = max(range(len(group)), key=group.__getitem__)
-        predictions.append(JUDGE_LABELS[best_index])
-    return predictions
+    return [
+        classify_judge_pairwise_from_tokens(
+            model,
+            tokenizer,
+            device,
+            dtype,
+            architecture,
+            prompt_tokens,
+        )
+        for prompt_tokens in prompt_tokens_batch
+    ]
 
 
 def clear_cuda_cache() -> None:
@@ -1259,15 +1268,18 @@ def classify_judge_pairwise_from_tokens(
     architecture: str,
     prompt_tokens: PromptTokens,
 ) -> str:
-    scores = score_candidate_answers_from_tokens(
-        model,
-        tokenizer,
-        device,
-        dtype,
-        architecture,
-        prompt_tokens,
-        JUDGE_LABELS,
-    )
+    scores = [
+        score_candidate_answer_from_tokens(
+            model,
+            tokenizer,
+            device,
+            dtype,
+            architecture,
+            prompt_tokens,
+            label,
+        )
+        for label in JUDGE_LABELS
+    ]
     best_index = max(range(len(scores)), key=scores.__getitem__)
     return JUDGE_LABELS[best_index]
 
@@ -1312,6 +1324,8 @@ def evaluate_judge_pairwise(
 
     total = 0
     accuracy = 0.0
+    swapped_accuracy = 0.0
+    adversarial_accuracy = 0.0
     swap_consistency = 0.0
     first_position_wins = 0.0
     swapped_first_position_wins = 0.0
@@ -1326,8 +1340,16 @@ def evaluate_judge_pairwise(
         swapped_prompt_tokens = []
         gold_labels = []
         for row in batch_rows:
-            prompt_default, gold = prompt_for_judge_pairwise(row, swap=False)
-            prompt_swapped, _ = prompt_for_judge_pairwise(row, swap=True)
+            prompt_default, gold = prompt_for_judge_pairwise(
+                row,
+                swap=False,
+                swap_mode=args.judge_swap_mode,
+            )
+            prompt_swapped, _ = prompt_for_judge_pairwise(
+                row,
+                swap=True,
+                swap_mode=args.judge_swap_mode,
+            )
             default_prompt_tokens.append(
                 build_prompt_token_bundle(
                     tokenizer,
@@ -1375,13 +1397,19 @@ def evaluate_judge_pairwise(
         ):
             total += 1
             accuracy += 1.0 if pred == gold else 0.0
-            swap_consistency += 1.0 if pred_swapped == swap_judge_label(pred) else 0.0
-            first_position_wins += 1.0 if pred == "A" else 0.0
-            swapped_first_position_wins += 1.0 if pred_swapped == "A" else 0.0
+            swapped_accuracy += 1.0 if pred_swapped == gold else 0.0
+            adversarial_accuracy += (
+                1.0 if pred == gold and pred_swapped == gold else 0.0
+            )
+            swap_consistency += 1.0 if pred_swapped == pred else 0.0
+            first_position_wins += 1.0 if pred == "A7" else 0.0
+            swapped_first_position_wins += 1.0 if pred_swapped == "A7" else 0.0
         start += current_batch_size
 
     return {
         "accuracy": accuracy / total,
+        "swapped_order_accuracy": swapped_accuracy / total,
+        "adversarial_order_accuracy": adversarial_accuracy / total,
         "swap_consistency": swap_consistency / total,
         "first_position_win_rate": first_position_wins / total,
         "swapped_first_position_win_rate": swapped_first_position_wins / total,
@@ -1537,6 +1565,7 @@ def main() -> None:
                     row,
                     args.architecture,
                     swap=bool(row.get("__swap__", False)),
+                    swap_mode=args.judge_swap_mode,
                 )
             else:
                 encode_fn = lambda row: encode_benchmark_example(
