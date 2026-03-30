@@ -1,0 +1,13 @@
+{
+  "accuracy": 0.5438311688311688,
+  "human_agreement": 0.5438311688311688,
+  "no_tie_accuracy": 0.7427937915742794,
+  "tie_precision": 0.0,
+  "tie_recall": 0.0,
+  "tie_f1": 0.0,
+  "swap_consistency": 0.9935064935064936,
+  "first_position_win_rate": 0.5113636363636364,
+  "swapped_first_position_win_rate": 0.48214285714285715,
+  "num_examples": 616,
+  "num_no_tie_examples": 451
+}
