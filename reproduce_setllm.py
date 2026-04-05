@@ -44,6 +44,37 @@ IGNORE_INDEX = -100
 JUDGE_LABELS = ("A7", "A8", "Tie")
 
 
+def judge_label_candidates(example: dict) -> tuple[str, str, str]:
+    return (
+        example.get("label_a", "A7"),
+        example.get("label_b", "A8"),
+        "Tie",
+    )
+
+
+def judge_first_position_label(example: dict, *, swap: bool, swap_mode: str) -> str:
+    label_a, label_b, _ = judge_label_candidates(example)
+    if swap and swap_mode == "permute_elements":
+        return label_b
+    return label_a
+
+
+def within_normalized_margin(score_a: float, score_b: float, margin: float) -> bool:
+    scale = max(abs(score_a), abs(score_b), 1e-6)
+    return abs(score_a - score_b) / scale <= margin
+
+
+def normalized_margin_excess(
+    score_a: torch.Tensor,
+    score_b: torch.Tensor,
+    margin: float,
+) -> torch.Tensor:
+    eps = torch.tensor(1e-6, device=score_a.device, dtype=score_a.dtype)
+    scale = torch.maximum(torch.maximum(score_a.abs(), score_b.abs()), eps)
+    normalized_gap = (score_a - score_b).abs() / scale
+    return torch.relu(normalized_gap - margin)
+
+
 @dataclass
 class TextSpan:
     text: str
@@ -180,6 +211,15 @@ def parse_args() -> argparse.Namespace:
         help=(
             "How to build swapped judge prompts: either permute the two set elements "
             "as a whole, or swap the response contents while keeping the A/B element order fixed."
+        ),
+    )
+    parser.add_argument(
+        "--judge-tie-margin",
+        type=float,
+        default=0.1,
+        help=(
+            "Predict Tie when the top two judge label scores are within this normalized "
+            "average-logprob margin, relative to the larger score magnitude."
         ),
     )
     return parser.parse_args()
@@ -652,8 +692,14 @@ def encode_instruction_example(
     return encoded
 
 
-def normalize_judge_label(label: str) -> str:
+def normalize_judge_label(
+    label: str, candidate_labels: Sequence[str] | None = None
+) -> str:
     value = label.strip().lower()
+    if candidate_labels is not None:
+        candidate_map = {candidate.lower(): candidate for candidate in candidate_labels}
+        if value in candidate_map:
+            return candidate_map[value]
     mapping = {
         "a": "A7",
         "a7": "A7",
@@ -697,10 +743,11 @@ def prompt_for_judge_pairwise(
 ) -> tuple[MixedPrompt, str]:
     response_a = example["response_a"].strip()
     response_b = example["response_b"].strip()
-    label = normalize_judge_label(example["label"])
+    label_a, label_b, tie_label = judge_label_candidates(example)
+    label = normalize_judge_label(example["label"], (label_a, label_b, tie_label))
     elements = [
-        f"[Response A7]\n{response_a}\n",
-        f"[Response A8]\n{response_b}\n",
+        f"[Response {label_a}]\n{response_a}\nAnswer label: {label_a}\n",
+        f"[Response {label_b}]\n{response_b}\nAnswer label: {label_b}\n",
     ]
     if swap:
         if swap_mode == "permute_elements":
@@ -708,8 +755,8 @@ def prompt_for_judge_pairwise(
         elif swap_mode == "swap_labels_and_answers":
             response_a, response_b = response_b, response_a
             elements = [
-                f"[Response A7]\n{response_a}\n",
-                f"[Response A8]\n{response_b}\n",
+                f"[Response {label_a}]\n{response_a}\nAnswer label: {label_a}\n",
+                f"[Response {label_b}]\n{response_b}\nAnswer label: {label_b}\n",
             ]
         else:
             raise ValueError(f"Unsupported judge swap mode: {swap_mode}")
@@ -718,7 +765,8 @@ def prompt_for_judge_pairwise(
         TextSpan(
             "You are an impartial judge evaluating the quality of two assistant responses.\n"
             "Consider helpfulness, correctness, completeness, and instruction following.\n"
-            "Return exactly one label: A7, A8, or Tie.\n\n"
+            "Return only the H_ label shown in the header of the better response.\n"
+            "Output exactly the label text and nothing else.\n\n"
             f"User prompt:\n{example['prompt'].strip()}\n\n"
             "Candidate responses:\n"
         ),
@@ -766,6 +814,8 @@ def encode_judge_example(
         **encoded.metadata,
         "task": "judge_pairwise",
         "label": label,
+        "candidate_labels": judge_label_candidates(example),
+        "prompt_tokens": prompt_tokens,
         "swapped": swap,
     }
     return encoded
@@ -956,13 +1006,60 @@ def run_training_epoch(
     running_loss = 0.0
 
     for step, batch in enumerate(dataloader, start=1):
-        model_inputs = batch_to_model_inputs(
-            batch, tokenizer, device, dtype, architecture
+        has_tie_judge_example = any(
+            item.metadata.get("task") == "judge_pairwise"
+            and item.metadata.get("label") == "Tie"
+            for item in batch
         )
-        outputs = model(**model_inputs)
-        loss = outputs.loss / gradient_accumulation_steps
-        loss.backward()
-        running_loss += outputs.loss.detach().float().item()
+        if not has_tie_judge_example:
+            model_inputs = batch_to_model_inputs(
+                batch, tokenizer, device, dtype, architecture
+            )
+            outputs = model(**model_inputs)
+            loss = outputs.loss / gradient_accumulation_steps
+            loss.backward()
+            running_loss += outputs.loss.detach().float().item()
+        else:
+            batch_losses = []
+            for item in batch:
+                if (
+                    item.metadata.get("task") == "judge_pairwise"
+                    and item.metadata.get("label") == "Tie"
+                ):
+                    prompt_tokens = item.metadata["prompt_tokens"]
+                    label_a, label_b, _ = item.metadata["candidate_labels"]
+                    score_a = candidate_answer_avg_score_tensor_from_tokens(
+                        model,
+                        tokenizer,
+                        device,
+                        dtype,
+                        architecture,
+                        prompt_tokens,
+                        label_a,
+                    )
+                    score_b = candidate_answer_avg_score_tensor_from_tokens(
+                        model,
+                        tokenizer,
+                        device,
+                        dtype,
+                        architecture,
+                        prompt_tokens,
+                        label_b,
+                    )
+                    item_loss = normalized_margin_excess(
+                        score_a, score_b, getattr(model, "judge_tie_margin", 0.02)
+                    )
+                else:
+                    model_inputs = batch_to_model_inputs(
+                        [item], tokenizer, device, dtype, architecture
+                    )
+                    item_loss = model(**model_inputs).loss
+                batch_losses.append(item_loss)
+
+            outputs_loss = torch.stack(batch_losses).mean()
+            loss = outputs_loss / gradient_accumulation_steps
+            loss.backward()
+            running_loss += outputs_loss.detach().float().item()
 
         if step % gradient_accumulation_steps == 0:
             optimizer.step()
@@ -996,6 +1093,7 @@ def train_stage(
         encoded, batch_size=args.batch_size, shuffle=True, collate_fn=lambda rows: rows
     )
     model.to(device=device, dtype=dtype)
+    setattr(model, "judge_tie_margin", args.judge_tie_margin)
 
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(
@@ -1152,6 +1250,69 @@ def score_candidate_answer_from_tokens(
 
 
 @torch.no_grad()
+def score_candidate_answer_avg_from_tokens(
+    model: nn.Module,
+    tokenizer: AutoTokenizer,
+    device: torch.device,
+    dtype: torch.dtype,
+    architecture: str,
+    prompt_tokens: PromptTokens,
+    candidate_answer: str,
+) -> float:
+    return candidate_answer_avg_score_tensor_from_tokens(
+        model,
+        tokenizer,
+        device,
+        dtype,
+        architecture,
+        prompt_tokens,
+        candidate_answer,
+    ).item()
+
+
+def candidate_answer_avg_score_tensor_from_tokens(
+    model: nn.Module,
+    tokenizer: AutoTokenizer,
+    device: torch.device,
+    dtype: torch.dtype,
+    architecture: str,
+    prompt_tokens: PromptTokens,
+    candidate_answer: str,
+) -> torch.Tensor:
+    encoded = append_response_tokens(
+        tokenizer,
+        prompt_ids=prompt_tokens.input_ids,
+        prompt_position_ids=prompt_tokens.position_ids,
+        prompt_set_ids=prompt_tokens.set_ids,
+        prompt_seq_ids=prompt_tokens.seq_ids,
+        response_text=candidate_answer,
+        add_eos=True,
+    )
+    if architecture != "vanilla":
+        full_pattern = extend_prompt_attention_pattern(
+            prompt_tokens,
+            len(encoded.input_ids) - encoded.prompt_length,
+            architecture,
+        )
+        encoded.metadata["attention_pattern"] = full_pattern
+    model_inputs = batch_to_model_inputs(
+        [encoded], tokenizer, device, dtype, architecture
+    )
+    logits = forward_for_scoring(model, model_inputs)[:, :-1, :]
+    labels = model_inputs["labels"][:, 1:]
+    loss_fct = nn.CrossEntropyLoss(ignore_index=IGNORE_INDEX, reduction="none")
+    token_losses = loss_fct(
+        logits.reshape(-1, logits.size(-1)), labels.reshape(-1)
+    ).view_as(labels)
+    answer_mask = labels.ne(IGNORE_INDEX)
+    token_count = int(answer_mask.sum().item())
+    nll = token_losses[answer_mask].sum()
+    if token_count == 0:
+        return torch.tensor(float("-inf"), device=device, dtype=logits.dtype)
+    return -(nll / token_count)
+
+
+@torch.no_grad()
 def score_candidate_answers_from_tokens(
     model: nn.Module,
     tokenizer: AutoTokenizer,
@@ -1205,6 +1366,8 @@ def classify_judge_pairwise_batch_from_tokens(
     dtype: torch.dtype,
     architecture: str,
     prompt_tokens_batch: Sequence[PromptTokens],
+    candidate_labels_batch: Sequence[Sequence[str]],
+    tie_margin: float,
 ) -> list[str]:
     return [
         classify_judge_pairwise_from_tokens(
@@ -1214,8 +1377,12 @@ def classify_judge_pairwise_batch_from_tokens(
             dtype,
             architecture,
             prompt_tokens,
+            candidate_labels,
+            tie_margin,
         )
-        for prompt_tokens in prompt_tokens_batch
+        for prompt_tokens, candidate_labels in zip(
+            prompt_tokens_batch, candidate_labels_batch, strict=True
+        )
     ]
 
 
@@ -1267,9 +1434,12 @@ def classify_judge_pairwise_from_tokens(
     dtype: torch.dtype,
     architecture: str,
     prompt_tokens: PromptTokens,
+    candidate_labels: Sequence[str],
+    tie_margin: float,
 ) -> str:
+    label_a, label_b, tie_label = candidate_labels
     scores = [
-        score_candidate_answer_from_tokens(
+        score_candidate_answer_avg_from_tokens(
             model,
             tokenizer,
             device,
@@ -1278,10 +1448,11 @@ def classify_judge_pairwise_from_tokens(
             prompt_tokens,
             label,
         )
-        for label in JUDGE_LABELS
+        for label in (label_a, label_b)
     ]
-    best_index = max(range(len(scores)), key=scores.__getitem__)
-    return JUDGE_LABELS[best_index]
+    if within_normalized_margin(scores[0], scores[1], tie_margin):
+        return tie_label
+    return label_a if scores[0] > scores[1] else label_b
 
 
 @torch.no_grad()
@@ -1292,6 +1463,8 @@ def classify_judge_pairwise(
     dtype: torch.dtype,
     architecture: str,
     prompt: Sequence[TextSpan | SetSpan],
+    candidate_labels: Sequence[str] = JUDGE_LABELS,
+    tie_margin: float = 0.1,
 ) -> str:
     prompt_tokens = build_prompt_token_bundle(
         tokenizer,
@@ -1306,10 +1479,23 @@ def classify_judge_pairwise(
         dtype,
         architecture,
         prompt_tokens,
+        candidate_labels,
+        tie_margin,
     )
 
 
 @torch.no_grad()
+def _response_length_bucket(row: dict) -> str:
+    len_a = len(row.get("response_a", "").split())
+    len_b = len(row.get("response_b", "").split())
+    max_len = max(len_a, len_b)
+    if max_len < 100:
+        return "short"
+    if max_len < 300:
+        return "medium"
+    return "long"
+
+
 def evaluate_judge_pairwise(
     *,
     model: nn.Module,
@@ -1330,6 +1516,8 @@ def evaluate_judge_pairwise(
     first_position_wins = 0.0
     swapped_first_position_wins = 0.0
 
+    per_example: list[dict] = []
+
     rows = list(dataset)
     batch_size = max(1, args.eval_batch_size)
     start = 0
@@ -1338,7 +1526,10 @@ def evaluate_judge_pairwise(
         batch_rows = rows[start : start + current_batch_size]
         default_prompt_tokens = []
         swapped_prompt_tokens = []
+        candidate_labels_batch = []
         gold_labels = []
+        first_labels = []
+        swapped_first_labels = []
         for row in batch_rows:
             prompt_default, gold = prompt_for_judge_pairwise(
                 row,
@@ -1350,6 +1541,7 @@ def evaluate_judge_pairwise(
                 swap=True,
                 swap_mode=args.judge_swap_mode,
             )
+            candidate_labels = judge_label_candidates(row)
             default_prompt_tokens.append(
                 build_prompt_token_bundle(
                     tokenizer,
@@ -1366,7 +1558,22 @@ def evaluate_judge_pairwise(
                     architecture=args.architecture,
                 )
             )
+            candidate_labels_batch.append(candidate_labels)
             gold_labels.append(gold)
+            first_labels.append(
+                judge_first_position_label(
+                    row,
+                    swap=False,
+                    swap_mode=args.judge_swap_mode,
+                )
+            )
+            swapped_first_labels.append(
+                judge_first_position_label(
+                    row,
+                    swap=True,
+                    swap_mode=args.judge_swap_mode,
+                )
+            )
 
         try:
             preds = classify_judge_pairwise_batch_from_tokens(
@@ -1376,6 +1583,8 @@ def evaluate_judge_pairwise(
                 dtype,
                 args.architecture,
                 default_prompt_tokens,
+                candidate_labels_batch,
+                args.judge_tie_margin,
             )
             preds_swapped = classify_judge_pairwise_batch_from_tokens(
                 model,
@@ -1384,6 +1593,8 @@ def evaluate_judge_pairwise(
                 dtype,
                 args.architecture,
                 swapped_prompt_tokens,
+                candidate_labels_batch,
+                args.judge_tie_margin,
             )
         except torch.OutOfMemoryError:
             if current_batch_size == 1:
@@ -1392,21 +1603,41 @@ def evaluate_judge_pairwise(
             batch_size = max(1, current_batch_size // 2)
             continue
 
-        for gold, pred, pred_swapped in zip(
-            gold_labels, preds, preds_swapped, strict=True
+        for row, gold, pred, pred_swapped, first_label, swapped_first_label in zip(
+            batch_rows,
+            gold_labels,
+            preds,
+            preds_swapped,
+            first_labels,
+            swapped_first_labels,
+            strict=True,
         ):
             total += 1
-            accuracy += 1.0 if pred == gold else 0.0
-            swapped_accuracy += 1.0 if pred_swapped == gold else 0.0
-            adversarial_accuracy += (
-                1.0 if pred == gold and pred_swapped == gold else 0.0
+            correct = pred == gold
+            swapped_correct = pred_swapped == gold
+            consistency = pred_swapped == pred
+            accuracy += 1.0 if correct else 0.0
+            swapped_accuracy += 1.0 if swapped_correct else 0.0
+            adversarial_accuracy += 1.0 if correct and swapped_correct else 0.0
+            swap_consistency += 1.0 if consistency else 0.0
+            first_position_wins += 1.0 if pred == first_label else 0.0
+            swapped_first_position_wins += (
+                1.0 if pred_swapped == swapped_first_label else 0.0
             )
-            swap_consistency += 1.0 if pred_swapped == pred else 0.0
-            first_position_wins += 1.0 if pred == "A7" else 0.0
-            swapped_first_position_wins += 1.0 if pred_swapped == "A7" else 0.0
+            per_example.append(
+                {
+                    "gold": gold,
+                    "pred": pred,
+                    "pred_swapped": pred_swapped,
+                    "correct": correct,
+                    "correct_swapped": swapped_correct,
+                    "consistent": consistency,
+                    "bucket": _response_length_bucket(row),
+                }
+            )
         start += current_batch_size
 
-    return {
+    overall = {
         "accuracy": accuracy / total,
         "swapped_order_accuracy": swapped_accuracy / total,
         "adversarial_order_accuracy": adversarial_accuracy / total,
@@ -1415,6 +1646,34 @@ def evaluate_judge_pairwise(
         "swapped_first_position_win_rate": swapped_first_position_wins / total,
         "num_examples": total,
     }
+
+    buckets = {}
+    bucket_names = sorted({ex["bucket"] for ex in per_example})
+    for bucket_name in bucket_names:
+        bucket_examples = [ex for ex in per_example if ex["bucket"] == bucket_name]
+        n = len(bucket_examples)
+        if n == 0:
+            continue
+        acc = sum(1.0 for ex in bucket_examples if ex["correct"]) / n
+        swacc = sum(1.0 for ex in bucket_examples if ex["correct_swapped"]) / n
+        adv = (
+            sum(
+                1.0 for ex in bucket_examples if ex["correct"] and ex["correct_swapped"]
+            )
+            / n
+        )
+        cons = sum(1.0 for ex in bucket_examples if ex["consistent"]) / n
+        buckets[bucket_name] = {
+            "accuracy": acc,
+            "swapped_order_accuracy": swacc,
+            "adversarial_order_accuracy": adv,
+            "swap_consistency": cons,
+            "num_examples": n,
+        }
+    if buckets:
+        overall["buckets"] = buckets
+
+    return overall
 
 
 @torch.no_grad()

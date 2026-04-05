@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import random
 from pathlib import Path
@@ -47,6 +48,12 @@ def parse_args() -> argparse.Namespace:
             "Create a swapped benchmark by exchanging response_a and response_b and "
             "flipping the pairwise label accordingly."
         ),
+    )
+    parser.add_argument(
+        "--label-mode",
+        choices=["standard", "hash"],
+        default="standard",
+        help="Use fixed surface labels or response-text hash labels for pairwise responses.",
     )
     parser.add_argument("--seed", type=int, default=42)
     return parser.parse_args()
@@ -120,11 +127,22 @@ def convert_local_pair_row(row: dict, *, source: str, index: int) -> dict:
     }
 
 
-def convert_judgebench_row(row: dict, *, source_file: str, index: int) -> dict:
+def hash_label(text: str) -> str:
+    digest = hashlib.sha1(text.strip().encode("utf-8")).hexdigest()[:4]
+    return f"H_{digest}"
+
+
+def convert_judgebench_row(
+    row: dict, *, source_file: str, index: int, label_mode: str
+) -> dict:
+    response_a = row["response_A"].strip()
+    response_b = row["response_B"].strip()
+    label_a = "A7" if label_mode == "standard" else hash_label(response_a)
+    label_b = "A8" if label_mode == "standard" else hash_label(response_b)
     label_value = row["label"].strip()
     label_map = {
-        "A>B": "A7",
-        "B>A": "A8",
+        "A>B": label_a,
+        "B>A": label_b,
         "A=B": "Tie",
         "B=A": "Tie",
     }
@@ -132,8 +150,10 @@ def convert_judgebench_row(row: dict, *, source_file: str, index: int) -> dict:
         raise ValueError(f"Unsupported JudgeBench label: {label_value}")
     return {
         "prompt": row["question"].strip(),
-        "response_a": row["response_A"].strip(),
-        "response_b": row["response_B"].strip(),
+        "response_a": response_a,
+        "response_b": response_b,
+        "label_a": label_a,
+        "label_b": label_b,
         "label": label_map[label_value],
         "question_id": f"judgebench-{row['original_id']}",
         "pair_id": row["pair_id"],
@@ -152,15 +172,15 @@ def swap_pairwise_row(row: dict) -> dict:
     swapped = dict(row)
     swapped["response_a"] = row["response_b"]
     swapped["response_b"] = row["response_a"]
+    label_a = row.get("label_a", "A7")
+    label_b = row.get("label_b", "A8")
+    swapped["label_a"] = label_b
+    swapped["label_b"] = label_a
     label = row["label"]
-    if label == "A":
-        swapped["label"] = "A8"
-    elif label == "B":
-        swapped["label"] = "A7"
-    elif label == "A7":
-        swapped["label"] = "A8"
-    elif label == "A8":
-        swapped["label"] = "A7"
+    if label == label_a:
+        swapped["label"] = label_b
+    elif label == label_b:
+        swapped["label"] = label_a
     else:
         swapped["label"] = label
     swapped["question_id"] = f"{row['question_id']}-swapped"
@@ -238,6 +258,7 @@ def main() -> None:
                                 json.loads(line),
                                 source_file=dataset_path.name,
                                 index=index,
+                                label_mode=args.label_mode,
                             )
                         )
             question_ids = sorted({row["question_id"] for row in converted})
@@ -270,6 +291,7 @@ def main() -> None:
                 "source": args.source,
                 "split_name": args.split_name,
                 "swap_sides": args.swap_sides,
+                "label_mode": args.label_mode,
                 "num_rows": len(converted),
                 "num_train_rows": len(train_rows),
                 "num_eval_rows": len(eval_rows),
@@ -316,6 +338,7 @@ def main() -> None:
         "source": args.source,
         "split_name": args.split_name,
         "swap_sides": args.swap_sides,
+        "label_mode": args.label_mode,
         "num_rows": len(converted),
         "num_train_rows": len(train_rows),
         "num_eval_rows": len(eval_rows),
