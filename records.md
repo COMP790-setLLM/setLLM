@@ -506,3 +506,108 @@ Takeaway:
 - Important result-tracking note:
   - all earlier `setcausal` runs recorded above used the pre-fix hybrid mask
   - those numbers are therefore not directly comparable to future runs with the corrected implementation
+
+### 2026-04-06 JudgeBench Prompt Ablations After Corrected `setcausal`
+
+All results below use the corrected `setcausal` mask semantics from the note above.
+
+Judge prompt changes tested:
+
+- `hlabelprompt`
+  - changed the instruction from explicitly listing `label_a`, `label_b`, `Tie`
+  - new instruction: return only the `H_` label shown in the better response header
+  - removed `Tie` from the generated instruction because ties are handled by the evaluation margin, not by generation
+- `answerlabel`
+  - repeated each `H_` label after its response body using `Answer label: H_xxxx`
+  - motivation: improve label-to-response binding for decoder-style prompt encoding, especially for `setcausal`
+
+On the current remote machine, corrected judge runs were most reliable with `batch_size = 1` plus `PYTORCH_ALLOC_CONF=expandable_segments:True`.
+
+#### `hlabelprompt` Results, Seed 42
+
+- `vanilla`
+  - W&B: `https://wandb.ai/ko-the-university-of-north-carolina-at-chapel-hill/setllm-judge/runs/xg0v2hj6`
+  - `accuracy = 0.48794`
+  - `swapped_order_accuracy = 0.49866`
+  - `adversarial_order_accuracy = 0.20107`
+  - `swap_consistency = 0.39678`
+- `setllm`
+  - W&B: `https://wandb.ai/ko-the-university-of-north-carolina-at-chapel-hill/setllm-judge/runs/q1ckxl2l`
+  - `accuracy = 0.50134`
+  - `swapped_order_accuracy = 0.50134`
+  - `adversarial_order_accuracy = 0.50134`
+  - `swap_consistency = 1.0`
+- `setcausal`
+  - W&B: `https://wandb.ai/ko-the-university-of-north-carolina-at-chapel-hill/setllm-judge/runs/tia09ao4`
+  - `accuracy = 0.45576`
+  - `swapped_order_accuracy = 0.45576`
+  - `adversarial_order_accuracy = 0.45576`
+  - `swap_consistency = 1.0`
+
+Interpretation:
+
+- removing the explicit label-order instruction removed the old shortcut that had favored the original prompt format
+- `setllm` improved substantially under this cleaner prompt
+- corrected `setcausal` became much less biased, but raw accuracy dropped, suggesting weaker label-to-response binding than `setllm`
+
+#### `answerlabel` Results, Seed 42
+
+- `vanilla`
+  - W&B: `https://wandb.ai/ko-the-university-of-north-carolina-at-chapel-hill/setllm-judge/runs/5lut1vi1`
+  - `accuracy = 0.49598`
+  - `swapped_order_accuracy = 0.49866`
+  - `adversarial_order_accuracy = 0.17962`
+  - `swap_consistency = 0.35121`
+- `setllm`
+  - W&B: `https://wandb.ai/ko-the-university-of-north-carolina-at-chapel-hill/setllm-judge/runs/7pjkuqax`
+  - `accuracy = 0.47721`
+  - `swapped_order_accuracy = 0.47721`
+  - `adversarial_order_accuracy = 0.47721`
+  - `swap_consistency = 1.0`
+- `setcausal`
+  - W&B: `https://wandb.ai/ko-the-university-of-north-carolina-at-chapel-hill/setllm-judge/runs/vwj0d7u3`
+  - `accuracy = 0.48257`
+  - `swapped_order_accuracy = 0.48257`
+  - `adversarial_order_accuracy = 0.48257`
+  - `swap_consistency = 1.0`
+
+Interpretation:
+
+- repeating the label after each response helped corrected `setcausal` recover from `0.45576` to `0.48257`
+- this supports the hypothesis that corrected `setcausal` struggles more than `setllm` with binding an early label token to a long later response body
+- however, the same prompt redundancy hurt `setllm` relative to the plain `hlabelprompt` variant
+
+#### `answerlabel` Reproducibility Check, Seed 123
+
+- `vanilla`
+  - W&B: `https://wandb.ai/ko-the-university-of-north-carolina-at-chapel-hill/setllm-judge/runs/m08c9j80`
+  - `accuracy = 0.49598`
+  - `swapped_order_accuracy = 0.50402`
+  - `adversarial_order_accuracy = 0.19035`
+  - `swap_consistency = 0.35925`
+- `setllm`
+  - W&B: `https://wandb.ai/ko-the-university-of-north-carolina-at-chapel-hill/setllm-judge/runs/pxos16hx`
+  - `accuracy = 0.48525`
+  - `swapped_order_accuracy = 0.48525`
+  - `adversarial_order_accuracy = 0.48525`
+  - `swap_consistency = 1.0`
+- `setcausal`
+  - W&B: `https://wandb.ai/ko-the-university-of-north-carolina-at-chapel-hill/setllm-judge/runs/yrpa0c3r`
+  - `accuracy = 0.47989`
+  - `swapped_order_accuracy = 0.47989`
+  - `adversarial_order_accuracy = 0.47989`
+  - `swap_consistency = 1.0`
+
+Seed-42 vs seed-123 summary for `answerlabel`:
+
+- `vanilla`: `0.49598 -> 0.49598`
+- `setllm`: `0.47721 -> 0.48525`
+- `setcausal`: `0.48257 -> 0.47989`
+
+Takeaways:
+
+- the `answerlabel` comparison is fairly reproducible across two seeds
+- `vanilla` remains the highest raw-accuracy model, but still has poor swap consistency and adversarial robustness
+- corrected `setllm` and corrected `setcausal` are now close under the `answerlabel` prompt, with small seed-dependent differences
+- corrected `setcausal` does not clearly beat `vanilla` on clean JudgeBench accuracy under the current setup
+- the main stable result is that prompt wording strongly affects judge behavior, especially for invariant architectures
