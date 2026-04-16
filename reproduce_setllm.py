@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Any, Iterable, Iterator, Sequence, Union
 
 import torch
+import torch.nn.functional as F
 from datasets import Dataset, load_dataset
 from peft import LoraConfig, PeftModel, get_peft_model
 from torch import nn
@@ -76,6 +77,7 @@ class PromptTokens:
     seq_ids: list[int]
     prompt_pattern: torch.Tensor | None = None
     score_positions: tuple[int, ...] | None = None
+    score_spans: tuple[tuple[int, ...], ...] | None = None
 
 
 class SymmetricTieHead(nn.Module):
@@ -191,6 +193,14 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--eval-adapter-dir",
+        default=None,
+        help=(
+            "Optional adapter directory to load for eval-only runs. "
+            "Useful for re-evaluating an existing LoRA checkpoint without retraining."
+        ),
+    )
+    parser.add_argument(
         "--judge-prompt-style",
         choices=["named_ab", "anonymous_slots"],
         default="named_ab",
@@ -221,6 +231,80 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=1.0,
         help="Optional class weight multiplier for the Tie class under symmetric_scoring.",
+    )
+    parser.add_argument(
+        "--judge-tie-diff-penalty",
+        type=float,
+        default=0.0,
+        help=(
+            "Optional coefficient for an |score_1 - score_2| penalty on gold Tie "
+            "examples under symmetric_scoring."
+        ),
+    )
+    parser.add_argument(
+        "--judge-tie-threshold",
+        type=float,
+        default=None,
+        help=(
+            "Optional inference-time threshold for symmetric_scoring. "
+            "If |score_1 - score_2| is at most this value, predict Tie directly "
+            "before argmax over [win_1, tie, win_2]."
+        ),
+    )
+    parser.add_argument(
+        "--judge-d-only",
+        action="store_true",
+        help=(
+            "Disable the learned tie head under symmetric_scoring and use the "
+            "score difference d as the only decision signal. Ties are then "
+            "handled purely through the calibrated |d| <= tau rule."
+        ),
+    )
+    parser.add_argument(
+        "--judge-score-anchor-position",
+        choices=["first", "last"],
+        default="last",
+        help=(
+            "Which token inside the per-candidate score anchor to read for "
+            "symmetric_scoring. 'last' preserves the original implementation; "
+            "'first' avoids using the anchor's terminal token as the candidate "
+            "readout."
+        ),
+    )
+    parser.add_argument(
+        "--judge-score-anchor-pooling",
+        choices=["single", "mean"],
+        default="single",
+        help=(
+            "How to pool hidden states from the per-candidate score anchor. "
+            "'single' uses one token selected by --judge-score-anchor-position; "
+            "'mean' averages all anchor-token hidden states for a more stable "
+            "candidate readout."
+        ),
+    )
+    parser.add_argument(
+        "--judge-max-response-tokens",
+        type=int,
+        default=None,
+        help=(
+            "Optional per-response token cap for judge_pairwise inputs. "
+            "Useful for large pairwise datasets with very long responses that "
+            "would otherwise cause training or evaluation OOM."
+        ),
+    )
+    parser.add_argument(
+        "--local-files-only",
+        action="store_true",
+        help="Load model and tokenizer from the local Hugging Face cache only.",
+    )
+    parser.add_argument(
+        "--attn-implementation",
+        choices=["eager", "sdpa", "flash_attention_2"],
+        default=None,
+        help=(
+            "Optional Hugging Face attention backend override. "
+            "Useful for debugging model-specific issues with custom masks."
+        ),
     )
     return parser.parse_args()
 
@@ -260,6 +344,24 @@ def ensure_pad_token(tokenizer: AutoTokenizer) -> None:
 
 def tokenize_text(tokenizer: AutoTokenizer, text: str) -> list[int]:
     return tokenizer(text, add_special_tokens=False)["input_ids"]
+
+
+def truncate_text_to_max_tokens(
+    tokenizer: AutoTokenizer, text: str, max_tokens: int | None
+) -> str:
+    normalized = text.strip()
+    if max_tokens is None:
+        return normalized
+    token_ids = tokenize_text(tokenizer, normalized)
+    if len(token_ids) <= max_tokens:
+        return normalized
+    truncated_ids = token_ids[:max_tokens]
+    truncated_text = tokenizer.decode(
+        truncated_ids,
+        skip_special_tokens=True,
+        clean_up_tokenization_spaces=False,
+    )
+    return truncated_text.strip()
 
 
 def iter_permutations(
@@ -676,11 +778,14 @@ PROMPT_BUILDERS = {
 }
 
 
+# Note: some legacy benchmark ids (for example `piqa` and `social_i_qa`) relied on
+# dataset loading scripts that newer `datasets` releases no longer support. We use
+# parquet-backed Hub mirrors for compatibility on modern environments.
 HF_DATASETS = {
-    "piqa": ("piqa", None, "train", "validation"),
+    "piqa": ("lighteval/piqa", "plain_text", "train", "validation"),
     "arc": ("allenai/ai2_arc", "ARC-Challenge", "train", "validation"),
     "csqa": ("tau/commonsense_qa", None, "train", "validation"),
-    "siqa": ("social_i_qa", None, "train", "validation"),
+    "siqa": ("baber/social_i_qa", None, "train", "validation"),
 }
 
 
@@ -830,6 +935,14 @@ def swap_internal_judge_label(label: str, prompt_style: str) -> str:
     return canonical_to_internal_judge_label(swapped, prompt_style)
 
 
+def exact_match_tie_label(example: dict, prompt_style: str) -> str | None:
+    response_a = str(example.get("response_a", "")).strip()
+    response_b = str(example.get("response_b", "")).strip()
+    if response_a and response_a == response_b:
+        return canonical_to_internal_judge_label("Tie", prompt_style)
+    return None
+
+
 def judge_candidate_header(prompt_style: str, candidate_index: int) -> str:
     if prompt_style == "named_ab":
         label = "A" if candidate_index == 0 else "B"
@@ -842,11 +955,24 @@ def judge_candidate_header(prompt_style: str, candidate_index: int) -> str:
 def prompt_for_judge_pairwise(
     example: dict,
     *,
+    tokenizer: AutoTokenizer | None = None,
     swap: bool = False,
     prompt_style: str = "named_ab",
+    max_response_tokens: int | None = None,
 ) -> tuple[MixedPrompt, str]:
     response_a = example["response_a"].strip()
     response_b = example["response_b"].strip()
+    if max_response_tokens is not None:
+        if tokenizer is None:
+            raise ValueError(
+                "prompt_for_judge_pairwise needs tokenizer when max_response_tokens is set."
+            )
+        response_a = truncate_text_to_max_tokens(
+            tokenizer, response_a, max_response_tokens
+        )
+        response_b = truncate_text_to_max_tokens(
+            tokenizer, response_b, max_response_tokens
+        )
     label = normalize_judge_label(example["label"])
     if swap:
         response_a, response_b = response_b, response_a
@@ -900,10 +1026,22 @@ def build_judge_scoring_prompt_tokens(
     *,
     swap: bool = False,
     prompt_style: str = "anonymous_slots",
+    score_anchor_position: str = "last",
+    score_anchor_pooling: str = "single",
+    max_response_tokens: int | None = None,
     device: torch.device | None = None,
+    precompute_prompt_pattern: bool = True,
 ) -> tuple[PromptTokens, str]:
-    response_a = example["response_a"].strip()
-    response_b = example["response_b"].strip()
+    response_a = truncate_text_to_max_tokens(
+        tokenizer,
+        example["response_a"],
+        max_response_tokens,
+    )
+    response_b = truncate_text_to_max_tokens(
+        tokenizer,
+        example["response_b"],
+        max_response_tokens,
+    )
     label = normalize_judge_label(example["label"])
     if swap:
         response_a, response_b = response_b, response_a
@@ -918,6 +1056,9 @@ def build_judge_scoring_prompt_tokens(
         "Candidate responses:\n"
     )
     score_anchor = "\nOverall quality score"
+    score_anchor_ids = tokenize_text(tokenizer, score_anchor)
+    if not score_anchor_ids:
+        raise ValueError("judge scoring score_anchor must tokenize to at least one id.")
     element_texts = [
         f"{judge_candidate_header(prompt_style, 0)}{response_a}{score_anchor}",
         f"{judge_candidate_header(prompt_style, 1)}{response_b}{score_anchor}",
@@ -931,17 +1072,34 @@ def build_judge_scoring_prompt_tokens(
         architecture=architecture,
     )
     score_positions: list[int] = []
+    score_spans: list[tuple[int, ...]] = []
     cursor = 0
     if tokenizer.bos_token_id is not None:
         cursor += 1
     cursor += len(tokenize_text(tokenizer, intro_text))
     for element_text in element_texts:
         element_ids = tokenize_text(tokenizer, element_text)
-        score_positions.append(cursor + len(element_ids) - 1)
+        anchor_start = cursor + len(element_ids) - len(score_anchor_ids)
+        anchor_positions = tuple(
+            range(anchor_start, anchor_start + len(score_anchor_ids))
+        )
+        score_spans.append(anchor_positions)
+        if score_anchor_position == "first":
+            score_positions.append(anchor_positions[0])
+        elif score_anchor_position == "last":
+            score_positions.append(anchor_positions[-1])
+        else:
+            raise ValueError(
+                f"Unsupported judge_score_anchor_position: {score_anchor_position}"
+            )
         cursor += len(element_ids)
+    if score_anchor_pooling not in {"single", "mean"}:
+        raise ValueError(
+            f"Unsupported judge_score_anchor_pooling: {score_anchor_pooling}"
+        )
 
     prompt_pattern = None
-    if architecture != "vanilla":
+    if architecture != "vanilla" and precompute_prompt_pattern:
         prompt_pattern = build_attention_pattern(
             len(input_ids),
             len(input_ids),
@@ -958,6 +1116,7 @@ def build_judge_scoring_prompt_tokens(
         seq_ids=seq_ids,
         prompt_pattern=prompt_pattern,
         score_positions=tuple(score_positions),
+        score_spans=tuple(score_spans),
     )
     return prompt_tokens, canonical_to_internal_judge_label(label, prompt_style)
 
@@ -969,11 +1128,14 @@ def encode_judge_example(
     *,
     swap: bool = False,
     prompt_style: str = "named_ab",
+    max_response_tokens: int | None = None,
 ) -> EncodedExample:
     prompt, label = prompt_for_judge_pairwise(
         example,
+        tokenizer=tokenizer,
         swap=swap,
         prompt_style=prompt_style,
+        max_response_tokens=max_response_tokens,
     )
     prompt_ids, prompt_positions, prompt_set_ids, prompt_seq_ids = build_prompt_tokens(
         tokenizer,
@@ -1005,7 +1167,11 @@ def encode_judge_scoring_example(
     *,
     swap: bool = False,
     prompt_style: str = "anonymous_slots",
+    score_anchor_position: str = "last",
+    score_anchor_pooling: str = "single",
+    max_response_tokens: int | None = None,
     device: torch.device | None = None,
+    precompute_prompt_pattern: bool = True,
 ) -> EncodedExample:
     prompt_tokens, label = build_judge_scoring_prompt_tokens(
         tokenizer,
@@ -1013,7 +1179,11 @@ def encode_judge_scoring_example(
         architecture,
         swap=swap,
         prompt_style=prompt_style,
+        score_anchor_position=score_anchor_position,
+        score_anchor_pooling=score_anchor_pooling,
+        max_response_tokens=max_response_tokens,
         device=device,
+        precompute_prompt_pattern=precompute_prompt_pattern,
     )
     if prompt_tokens.score_positions is None:
         raise ValueError("Judge scoring prompt must include score positions.")
@@ -1025,8 +1195,9 @@ def encode_judge_scoring_example(
         ),
         "swapped": swap,
         "score_positions": prompt_tokens.score_positions,
+        "score_spans": prompt_tokens.score_spans,
     }
-    if architecture != "vanilla":
+    if architecture != "vanilla" and prompt_tokens.prompt_pattern is not None:
         metadata["attention_pattern"] = prompt_tokens.prompt_pattern
     return EncodedExample(
         input_ids=prompt_tokens.input_ids,
@@ -1135,20 +1306,28 @@ def hidden_size_from_config(model: nn.Module) -> int:
     raise RuntimeError("Could not infer model hidden size for judge scoring head.")
 
 
-def attach_judge_scoring_modules(model: nn.Module) -> None:
+def attach_judge_scoring_modules(
+    model: nn.Module, *, use_tie_head: bool = True
+) -> None:
     hidden_size = hidden_size_from_config(model)
     if not hasattr(model, "score_head"):
         model.score_head = nn.Linear(hidden_size, 1, bias=True)
-    if not hasattr(model, "tie_head"):
+    if use_tie_head and not hasattr(model, "tie_head"):
         model.tie_head = SymmetricTieHead(hidden_size)
 
 
-def get_model_with_scoring_modules(model: nn.Module) -> nn.Module:
-    if hasattr(model, "score_head") and hasattr(model, "tie_head"):
+def get_model_with_scoring_modules(
+    model: nn.Module, *, require_tie_head: bool = True
+) -> nn.Module:
+    if hasattr(model, "score_head") and (
+        not require_tie_head or hasattr(model, "tie_head")
+    ):
         return model
     if hasattr(model, "get_base_model"):
         base_model = model.get_base_model()
-        if hasattr(base_model, "score_head") and hasattr(base_model, "tie_head"):
+        if hasattr(base_model, "score_head") and (
+            not require_tie_head or hasattr(base_model, "tie_head")
+        ):
             return base_model
     raise RuntimeError("Judge scoring modules are missing from the model.")
 
@@ -1156,18 +1335,30 @@ def get_model_with_scoring_modules(model: nn.Module) -> nn.Module:
 def load_model_and_tokenizer(
     args: argparse.Namespace, train: bool
 ) -> tuple[AutoModelForCausalLM, AutoTokenizer]:
-    tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=True)
+    local_files_only = bool(
+        args.local_files_only
+        or os.environ.get("HF_HUB_OFFLINE") == "1"
+        or os.environ.get("TRANSFORMERS_OFFLINE") == "1"
+    )
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.model,
+        use_fast=True,
+        local_files_only=local_files_only,
+    )
     ensure_pad_token(tokenizer)
 
     dtype = get_dtype(args, train=train)
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model,
-        torch_dtype=dtype,
-        low_cpu_mem_usage=True,
-    )
+    model_kwargs: dict[str, Any] = {
+        "torch_dtype": dtype,
+        "low_cpu_mem_usage": True,
+        "local_files_only": local_files_only,
+    }
+    if args.attn_implementation:
+        model_kwargs["attn_implementation"] = args.attn_implementation
+    model = AutoModelForCausalLM.from_pretrained(args.model, **model_kwargs)
     model.config.use_cache = False
     if args.task == "judge_pairwise" and args.judge_readout == "symmetric_scoring":
-        attach_judge_scoring_modules(model)
+        attach_judge_scoring_modules(model, use_tie_head=not args.judge_d_only)
 
     if train:
         if args.gradient_checkpointing:
@@ -1177,7 +1368,9 @@ def load_model_and_tokenizer(
         target_modules = find_lora_target_modules(model)
         modules_to_save = None
         if args.task == "judge_pairwise" and args.judge_readout == "symmetric_scoring":
-            modules_to_save = ["score_head", "tie_head"]
+            modules_to_save = ["score_head"]
+            if not args.judge_d_only:
+                modules_to_save.append("tie_head")
         lora_config = LoraConfig(
             r=args.lora_r,
             lora_alpha=args.lora_alpha,
@@ -1221,18 +1414,35 @@ def init_wandb(args: argparse.Namespace, output_dir: Path) -> Any | None:
         ) from exc
 
     api_key = resolve_wandb_api_key()
-    if api_key:
-        wandb.login(key=api_key)
+    try:
+        if api_key:
+            wandb.login(key=api_key, relogin=True)
+    except Exception as exc:  # pragma: no cover - defensive integration path
+        print(f"[wandb] login skipped: {exc}", flush=True)
 
     config = vars(args).copy()
     config["output_dir"] = str(output_dir)
-    return wandb.init(
-        project=args.wandb_project,
-        entity=args.wandb_entity,
-        name=args.wandb_run_name,
-        config=config,
-        dir=str(output_dir),
-    )
+    try:
+        run = wandb.init(
+            project=args.wandb_project,
+            entity=args.wandb_entity,
+            name=args.wandb_run_name,
+            config=config,
+            dir=str(output_dir),
+        )
+        run_url = getattr(run, "url", None)
+        if run_url:
+            print(f"[wandb] run_url={run_url}", flush=True)
+        else:
+            print("[wandb] run initialized", flush=True)
+        return run
+    except Exception as exc:  # pragma: no cover - defensive integration path
+        print(
+            "[wandb] init failed; continuing without W&B logging: "
+            f"{type(exc).__name__}: {exc}",
+            flush=True,
+        )
+        return None
 
 
 def wandb_log(
@@ -1334,6 +1544,8 @@ def train_stage(
                 scheduler=scheduler,
                 gradient_accumulation_steps=args.gradient_accumulation_steps,
                 judge_tie_weight=args.judge_tie_weight,
+                judge_tie_diff_penalty=args.judge_tie_diff_penalty,
+                judge_d_only=args.judge_d_only,
                 global_step=global_step,
                 max_steps=args.update_steps,
             )
@@ -1418,6 +1630,8 @@ def encoded_prompt_only_from_tokens(prompt_tokens: PromptTokens) -> EncodedExamp
         metadata["attention_pattern"] = prompt_tokens.prompt_pattern
     if prompt_tokens.score_positions is not None:
         metadata["score_positions"] = prompt_tokens.score_positions
+    if prompt_tokens.score_spans is not None:
+        metadata["score_spans"] = prompt_tokens.score_spans
     return EncodedExample(
         input_ids=prompt_tokens.input_ids,
         labels=[IGNORE_INDEX] * len(prompt_tokens.input_ids),
@@ -1436,28 +1650,62 @@ def judge_scoring_logits_from_batch(
     dtype: torch.dtype,
     architecture: str,
     batch: Sequence[EncodedExample],
+    score_anchor_pooling: str = "single",
+    use_tie_head: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if not batch:
         raise ValueError("Judge scoring batch must not be empty.")
     score_positions = []
+    score_spans = []
     for item in batch:
         positions = item.metadata.get("score_positions")
         if positions is None or len(positions) != 2:
             raise ValueError("Judge scoring examples must have two score positions.")
         score_positions.append(tuple(int(pos) for pos in positions))
+        spans = item.metadata.get("score_spans")
+        if spans is not None:
+            score_spans.append(
+                tuple(tuple(int(pos) for pos in span) for span in spans)
+            )
 
     model_inputs = batch_to_model_inputs(
         list(batch), tokenizer, device, dtype, architecture
     )
     hidden_states = forward_for_hidden_states(model, model_inputs)
     batch_indices = torch.arange(hidden_states.size(0), device=device)
-    score_index_tensor = torch.tensor(score_positions, dtype=torch.long, device=device)
-    score_hidden = hidden_states[batch_indices.unsqueeze(1), score_index_tensor]
+    if score_anchor_pooling == "mean":
+        if not score_spans:
+            raise ValueError(
+                "judge scoring mean pooling requires score_spans metadata."
+            )
+        span_lengths = {len(span) for sample in score_spans for span in sample}
+        if len(span_lengths) != 1:
+            raise ValueError("score_spans must have a constant anchor length.")
+        score_span_tensor = torch.tensor(
+            score_spans, dtype=torch.long, device=device
+        )
+        score_hidden = hidden_states[
+            batch_indices.unsqueeze(1).unsqueeze(2), score_span_tensor
+        ].mean(dim=2)
+    elif score_anchor_pooling == "single":
+        score_index_tensor = torch.tensor(
+            score_positions, dtype=torch.long, device=device
+        )
+        score_hidden = hidden_states[batch_indices.unsqueeze(1), score_index_tensor]
+    else:
+        raise ValueError(
+            f"Unsupported judge_score_anchor_pooling: {score_anchor_pooling}"
+        )
 
-    scoring_model = get_model_with_scoring_modules(model)
+    scoring_model = get_model_with_scoring_modules(
+        model, require_tie_head=use_tie_head
+    )
     raw_scores = scoring_model.score_head(score_hidden).squeeze(-1)
     diff = raw_scores[:, 0] - raw_scores[:, 1]
-    tie_logit = scoring_model.tie_head(score_hidden.to(raw_scores.dtype))
+    if use_tie_head:
+        tie_logit = scoring_model.tie_head(score_hidden.to(raw_scores.dtype))
+    else:
+        tie_logit = torch.zeros_like(diff)
     class_logits = torch.stack([diff, tie_logit, -diff], dim=-1)
     return class_logits, raw_scores
 
@@ -1474,6 +1722,8 @@ def run_judge_scoring_training_epoch(
     scheduler,
     gradient_accumulation_steps: int,
     judge_tie_weight: float,
+    judge_tie_diff_penalty: float,
+    judge_d_only: bool,
     global_step: int,
     max_steps: int,
 ) -> tuple[int, float]:
@@ -1487,26 +1737,53 @@ def run_judge_scoring_training_epoch(
     )
 
     for step, batch in enumerate(dataloader, start=1):
-        class_logits, _ = judge_scoring_logits_from_batch(
+        class_logits, raw_scores = judge_scoring_logits_from_batch(
             model,
             tokenizer,
             device,
             dtype,
             architecture,
             batch,
+            use_tie_head=not judge_d_only,
         )
         targets = torch.tensor(
             [int(item.metadata["label_index"]) for item in batch],
             dtype=torch.long,
             device=device,
         )
-        # Keep the weighted classification loss in fp32 for numerical stability
-        # and to avoid bf16/float32 dtype mismatches under CUDA training.
-        loss = nn.functional.cross_entropy(
-            class_logits.float(),
-            targets,
-            weight=class_weights,
-        )
+        diff = (raw_scores[:, 0] - raw_scores[:, 1]).float()
+        tie_mask = targets == 1
+        if judge_d_only:
+            loss_terms: list[torch.Tensor] = []
+            non_tie_mask = ~tie_mask
+            if bool(non_tie_mask.any()):
+                target_sign = torch.where(
+                    targets[non_tie_mask] == 0,
+                    torch.ones_like(diff[non_tie_mask]),
+                    -torch.ones_like(diff[non_tie_mask]),
+                )
+                win_loss = F.softplus(-target_sign * diff[non_tie_mask]).mean()
+                loss_terms.append(win_loss)
+            if bool(tie_mask.any()):
+                tie_loss = diff[tie_mask].abs().mean()
+                loss_terms.append(judge_tie_weight * tie_loss)
+            if loss_terms:
+                loss = sum(loss_terms)
+            else:
+                loss = diff.sum() * 0.0
+        else:
+            # Keep the weighted classification loss in fp32 for numerical stability
+            # and to avoid bf16/float32 dtype mismatches under CUDA training.
+            loss = F.cross_entropy(
+                class_logits.float(),
+                targets,
+                weight=class_weights,
+            )
+
+        if judge_tie_diff_penalty > 0.0:
+            if bool(tie_mask.any()):
+                # Gold Tie examples should live near the score-equality boundary.
+                loss = loss + judge_tie_diff_penalty * diff[tie_mask].abs().mean()
         (loss / gradient_accumulation_steps).backward()
         running_loss += loss.detach().float().item()
 
@@ -1694,6 +1971,31 @@ def classify_judge_pairwise_batch_from_tokens(
 
 
 @torch.no_grad()
+def classify_judge_pairwise_logits(
+    class_logits: torch.Tensor,
+    prompt_style: str,
+    tie_threshold: float | None = None,
+    d_only: bool = False,
+) -> list[str]:
+    labels = judge_scoring_labels(prompt_style)
+    predictions = []
+    for logits in class_logits.float():
+        # Even under exact permutation-equivariant scoring, Tie examples can fail
+        # slot-flip consistency if diff == 0 but the tie logit is not the argmax.
+        # An explicit small-diff tie region makes the readout match the intended
+        # pairwise semantics more directly.
+        antisym_diff = 0.5 * float((logits[0] - logits[2]).item())
+        if tie_threshold is not None and abs(antisym_diff) <= tie_threshold:
+            predictions.append("Tie")
+            continue
+        if d_only:
+            predictions.append(labels[0] if antisym_diff > 0 else labels[2])
+            continue
+        predictions.append(labels[int(logits.argmax().item())])
+    return predictions
+
+
+@torch.no_grad()
 def classify_judge_pairwise_batch_scoring(
     model: nn.Module,
     tokenizer: AutoTokenizer,
@@ -1702,6 +2004,9 @@ def classify_judge_pairwise_batch_scoring(
     architecture: str,
     batch: Sequence[EncodedExample],
     prompt_style: str,
+    tie_threshold: float | None = None,
+    score_anchor_pooling: str = "single",
+    d_only: bool = False,
 ) -> list[str]:
     class_logits, _ = judge_scoring_logits_from_batch(
         model,
@@ -1710,12 +2015,15 @@ def classify_judge_pairwise_batch_scoring(
         dtype,
         architecture,
         batch,
+        score_anchor_pooling,
+        use_tie_head=not d_only,
     )
-    labels = judge_scoring_labels(prompt_style)
-    predictions = []
-    for index in class_logits.argmax(dim=-1).tolist():
-        predictions.append(labels[index])
-    return predictions
+    return classify_judge_pairwise_logits(
+        class_logits,
+        prompt_style,
+        tie_threshold,
+        d_only,
+    )
 
 
 def clear_cuda_cache() -> None:
@@ -1917,16 +2225,26 @@ def evaluate_judge_pairwise(
         default_prompt_tokens = []
         swapped_prompt_tokens = []
         gold_labels = []
+        duplicate_shortcuts: list[str | None] = []
         for row in batch_rows:
             prompt_default, gold = prompt_for_judge_pairwise(
                 row,
+                tokenizer=tokenizer,
                 swap=False,
                 prompt_style=args.judge_prompt_style,
+                max_response_tokens=args.judge_max_response_tokens,
             )
+            duplicate_tie = exact_match_tie_label(row, args.judge_prompt_style)
+            duplicate_shortcuts.append(duplicate_tie)
+            if duplicate_tie is not None:
+                gold_labels.append(gold)
+                continue
             prompt_swapped, _ = prompt_for_judge_pairwise(
                 row,
+                tokenizer=tokenizer,
                 swap=True,
                 prompt_style=args.judge_prompt_style,
+                max_response_tokens=args.judge_max_response_tokens,
             )
             default_prompt_tokens.append(
                 build_prompt_token_bundle(
@@ -1948,31 +2266,46 @@ def evaluate_judge_pairwise(
             )
             gold_labels.append(gold)
 
-        try:
-            preds = classify_judge_pairwise_batch_from_tokens(
-                model,
-                tokenizer,
-                device,
-                dtype,
-                args.architecture,
-                default_prompt_tokens,
-                judge_labels,
-            )
-            preds_swapped = classify_judge_pairwise_batch_from_tokens(
-                model,
-                tokenizer,
-                device,
-                dtype,
-                args.architecture,
-                swapped_prompt_tokens,
-                judge_labels,
-            )
-        except torch.OutOfMemoryError:
-            if current_batch_size == 1:
-                raise
-            clear_cuda_cache()
-            batch_size = max(1, current_batch_size // 2)
-            continue
+        preds_model: list[str] = []
+        preds_swapped_model: list[str] = []
+        if default_prompt_tokens:
+            try:
+                preds_model = classify_judge_pairwise_batch_from_tokens(
+                    model,
+                    tokenizer,
+                    device,
+                    dtype,
+                    args.architecture,
+                    default_prompt_tokens,
+                    judge_labels,
+                )
+                preds_swapped_model = classify_judge_pairwise_batch_from_tokens(
+                    model,
+                    tokenizer,
+                    device,
+                    dtype,
+                    args.architecture,
+                    swapped_prompt_tokens,
+                    judge_labels,
+                )
+            except torch.OutOfMemoryError:
+                if current_batch_size == 1:
+                    raise
+                clear_cuda_cache()
+                batch_size = max(1, current_batch_size // 2)
+                continue
+
+        preds = []
+        preds_swapped = []
+        pred_iter = iter(preds_model)
+        pred_swapped_iter = iter(preds_swapped_model)
+        for duplicate_tie in duplicate_shortcuts:
+            if duplicate_tie is not None:
+                preds.append(duplicate_tie)
+                preds_swapped.append(duplicate_tie)
+            else:
+                preds.append(next(pred_iter))
+                preds_swapped.append(next(pred_swapped_iter))
 
         if not (
             len(gold_labels) == len(preds) == len(preds_swapped)
@@ -2003,6 +2336,10 @@ def evaluate_judge_pairwise(
                     ),
                     "swap_consistent": pred_swapped
                     == swap_internal_judge_label(pred, args.judge_prompt_style),
+                    "exact_match_tie_shortcut": exact_match_tie_label(
+                        row, args.judge_prompt_style
+                    )
+                    is not None,
                 }
             )
         start += current_batch_size
@@ -2036,52 +2373,122 @@ def evaluate_judge_pairwise_scoring(
         default_batch = []
         swapped_batch = []
         gold_labels = []
+        duplicate_shortcuts: list[str | None] = []
         for row in batch_rows:
+            duplicate_tie = exact_match_tie_label(row, args.judge_prompt_style)
+            duplicate_shortcuts.append(duplicate_tie)
             default_encoded = encode_judge_scoring_example(
                 tokenizer,
                 row,
                 args.architecture,
                 swap=False,
                 prompt_style=args.judge_prompt_style,
+                score_anchor_position=args.judge_score_anchor_position,
+                score_anchor_pooling=args.judge_score_anchor_pooling,
+                max_response_tokens=args.judge_max_response_tokens,
                 device=device if args.architecture != "vanilla" else None,
             )
-            swapped_encoded = encode_judge_scoring_example(
-                tokenizer,
-                row,
-                args.architecture,
-                swap=True,
-                prompt_style=args.judge_prompt_style,
-                device=device if args.architecture != "vanilla" else None,
-            )
-            default_batch.append(default_encoded)
-            swapped_batch.append(swapped_encoded)
+            if duplicate_tie is None:
+                swapped_encoded = encode_judge_scoring_example(
+                    tokenizer,
+                    row,
+                    args.architecture,
+                    swap=True,
+                    prompt_style=args.judge_prompt_style,
+                    score_anchor_position=args.judge_score_anchor_position,
+                    score_anchor_pooling=args.judge_score_anchor_pooling,
+                    max_response_tokens=args.judge_max_response_tokens,
+                    device=device if args.architecture != "vanilla" else None,
+                )
+                default_batch.append(default_encoded)
+                swapped_batch.append(swapped_encoded)
             gold_labels.append(str(default_encoded.metadata["label"]))
 
-        try:
-            preds = classify_judge_pairwise_batch_scoring(
-                model,
-                tokenizer,
-                device,
-                dtype,
-                args.architecture,
-                default_batch,
-                args.judge_prompt_style,
-            )
-            preds_swapped = classify_judge_pairwise_batch_scoring(
-                model,
-                tokenizer,
-                device,
-                dtype,
-                args.architecture,
-                swapped_batch,
-                args.judge_prompt_style,
-            )
-        except torch.OutOfMemoryError:
-            if current_batch_size == 1:
-                raise
-            clear_cuda_cache()
-            batch_size = max(1, current_batch_size // 2)
-            continue
+        preds_model: list[str] = []
+        preds_swapped_model: list[str] = []
+        class_logits_model_list: list[list[float]] = []
+        class_logits_swapped_model_list: list[list[float]] = []
+        raw_scores_model_list: list[list[float]] = []
+        raw_scores_swapped_model_list: list[list[float]] = []
+        if default_batch:
+            try:
+                class_logits_model, raw_scores_model = judge_scoring_logits_from_batch(
+                    model,
+                    tokenizer,
+                    device,
+                    dtype,
+                    args.architecture,
+                    default_batch,
+                    args.judge_score_anchor_pooling,
+                    use_tie_head=not args.judge_d_only,
+                )
+                preds_model = classify_judge_pairwise_logits(
+                    class_logits_model,
+                    args.judge_prompt_style,
+                    args.judge_tie_threshold,
+                    args.judge_d_only,
+                )
+                class_logits_model_list = class_logits_model.float().cpu().tolist()
+                raw_scores_model_list = raw_scores_model.float().cpu().tolist()
+                del class_logits_model, raw_scores_model
+                clear_device_cache()
+
+                class_logits_swapped_model, raw_scores_swapped_model = judge_scoring_logits_from_batch(
+                    model,
+                    tokenizer,
+                    device,
+                    dtype,
+                    args.architecture,
+                    swapped_batch,
+                    args.judge_score_anchor_pooling,
+                    use_tie_head=not args.judge_d_only,
+                )
+                preds_swapped_model = classify_judge_pairwise_logits(
+                    class_logits_swapped_model,
+                    args.judge_prompt_style,
+                    args.judge_tie_threshold,
+                    args.judge_d_only,
+                )
+                class_logits_swapped_model_list = (
+                    class_logits_swapped_model.float().cpu().tolist()
+                )
+                raw_scores_swapped_model_list = (
+                    raw_scores_swapped_model.float().cpu().tolist()
+                )
+                del class_logits_swapped_model, raw_scores_swapped_model
+                clear_device_cache()
+            except torch.OutOfMemoryError:
+                if current_batch_size == 1:
+                    raise
+                clear_cuda_cache()
+                batch_size = max(1, current_batch_size // 2)
+                continue
+
+        preds = []
+        preds_swapped = []
+        score_details = []
+        pred_iter = iter(preds_model)
+        pred_swapped_iter = iter(preds_swapped_model)
+        logits_iter = iter(class_logits_model_list)
+        logits_swapped_iter = iter(class_logits_swapped_model_list)
+        scores_iter = iter(raw_scores_model_list)
+        scores_swapped_iter = iter(raw_scores_swapped_model_list)
+        for duplicate_tie in duplicate_shortcuts:
+            if duplicate_tie is not None:
+                preds.append(duplicate_tie)
+                preds_swapped.append(duplicate_tie)
+                score_details.append(None)
+            else:
+                preds.append(next(pred_iter))
+                preds_swapped.append(next(pred_swapped_iter))
+                score_details.append(
+                    {
+                        "default_logits": next(logits_iter),
+                        "swapped_logits": next(logits_swapped_iter),
+                        "default_scores": next(scores_iter),
+                        "swapped_scores": next(scores_swapped_iter),
+                    }
+                )
 
         if not (
             len(gold_labels) == len(preds) == len(preds_swapped)
@@ -2090,7 +2497,29 @@ def evaluate_judge_pairwise_scoring(
                 "Judge scoring eval batches must have matching gold labels and predictions."
             )
 
-        for row, gold, pred, pred_swapped in zip(batch_rows, gold_labels, preds, preds_swapped):
+        for row, gold, pred, pred_swapped, detail in zip(
+            batch_rows, gold_labels, preds, preds_swapped, score_details
+        ):
+            extra_fields: dict[str, Any] = {}
+            if detail is not None:
+                default_scores = detail["default_scores"]
+                swapped_scores = detail["swapped_scores"]
+                default_logits = detail["default_logits"]
+                swapped_logits = detail["swapped_logits"]
+                extra_fields = {
+                    "score_1": float(default_scores[0]),
+                    "score_2": float(default_scores[1]),
+                    "score_diff": float(default_scores[0] - default_scores[1]),
+                    "tie_logit": float(default_logits[1]),
+                    "win1_logit": float(default_logits[0]),
+                    "win2_logit": float(default_logits[2]),
+                    "swapped_score_1": float(swapped_scores[0]),
+                    "swapped_score_2": float(swapped_scores[1]),
+                    "swapped_score_diff": float(swapped_scores[0] - swapped_scores[1]),
+                    "swapped_tie_logit": float(swapped_logits[1]),
+                    "swapped_win1_logit": float(swapped_logits[0]),
+                    "swapped_win2_logit": float(swapped_logits[2]),
+                }
             prediction_rows.append(
                 {
                     "prompt": row.get("prompt"),
@@ -2113,6 +2542,11 @@ def evaluate_judge_pairwise_scoring(
                     ),
                     "swap_consistent": pred_swapped
                     == swap_internal_judge_label(pred, args.judge_prompt_style),
+                    "exact_match_tie_shortcut": exact_match_tie_label(
+                        row, args.judge_prompt_style
+                    )
+                    is not None,
+                    **extra_fields,
                 }
             )
         start += current_batch_size
@@ -2202,6 +2636,7 @@ def evaluate_with_separate_model(
     task: str,
     args: argparse.Namespace,
     output_dir: Path,
+    offload_training_model: bool = False,
 ) -> dict[str, float]:
     if not args.do_train:
         return evaluate_task(
@@ -2212,6 +2647,13 @@ def evaluate_with_separate_model(
             args=args,
             output_dir=output_dir,
         )
+
+    if offload_training_model and torch.cuda.is_available():
+        # Final eval can OOM on larger backbones if we keep both the training
+        # model and the freshly reloaded eval model resident on GPU at once.
+        training_model.to(device=torch.device("cpu"))
+        gc.collect()
+        clear_device_cache()
 
     with tempfile.TemporaryDirectory(prefix="eval-adapter-", dir=output_dir) as tmpdir:
         adapter_dir = Path(tmpdir)
@@ -2245,6 +2687,11 @@ def main() -> None:
 
     try:
         model, tokenizer = load_model_and_tokenizer(args, train=args.do_train)
+        if args.eval_adapter_dir and not args.do_train:
+            model = PeftModel.from_pretrained(
+                model, args.eval_adapter_dir, is_trainable=False
+            )
+            model.config.use_cache = False
         train_ds, eval_ds = load_task_datasets(args)
 
         train_ds = select_rows(train_ds, args.max_train_samples, args.seed)
@@ -2279,9 +2726,11 @@ def main() -> None:
                         args.architecture,
                         swap=bool(row.get("__swap__", False)),
                         prompt_style=args.judge_prompt_style,
-                        device=get_device()
-                        if args.architecture != "vanilla"
-                        else None,
+                        score_anchor_position=args.judge_score_anchor_position,
+                        score_anchor_pooling=args.judge_score_anchor_pooling,
+                        max_response_tokens=args.judge_max_response_tokens,
+                        device=None,
+                        precompute_prompt_pattern=False,
                     )
                 else:
                     encode_fn = lambda row: encode_judge_example(
@@ -2290,6 +2739,7 @@ def main() -> None:
                         args.architecture,
                         swap=bool(row.get("__swap__", False)),
                         prompt_style=args.judge_prompt_style,
+                        max_response_tokens=args.judge_max_response_tokens,
                     )
             else:
                 encode_fn = lambda row: encode_benchmark_example(
@@ -2320,6 +2770,7 @@ def main() -> None:
                 task=args.task,
                 args=args,
                 output_dir=output_dir,
+                offload_training_model=args.do_train,
             )
             metrics_path = output_dir / f"{args.task}-metrics.json"
             metrics_path.write_text(json.dumps(metrics, indent=2) + "\n")
