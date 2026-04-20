@@ -294,6 +294,32 @@ Current read:
 
 ---
 
+## MT-Bench: Early Matched Results
+
+| arch | acc | swap_consist | first_pos_win |
+| --- | ---: | ---: | ---: |
+| `vanilla` | `0.396` | `0.484` | `0.359` |
+| `setllm` | `0.390` | `1.000` | `0.515 (collapse)` |
+| `setcausal` | `0.417` | `1.000` | `0.357` |
+
+Takeaway:
+
+- `setcausal` is currently the best MT-Bench model on accuracy while preserving full swap consistency
+- the absolute accuracy is still low, and the `0.417` vs `0.390` gap is too small to support a strong claim
+- one likely explanation is that **Gemma 2B may simply be too weak to act as a reliable LLM judge** on MT-Bench
+- `setllm` remains invariant but shows a slot-1 collapse on this setup, so the next A/B diagnostic needs to separate hash-label artifacts from a deeper long-context failure
+
+---
+
+## Failed Attempts on Stronger Backbones
+
+- We tried `Qwen3.5 2B`, but its hybrid attention stack uses recurrent / convolutional updates that are inherently **sequence-order-sensitive**
+- That makes it a poor fit for a clean permutation-invariant `setllm` evaluation, even before downstream tuning
+- We also tried `Gemma 7B`, but `setllm` evaluation requires full precision and still **OOMs on 48 GB VRAM**
+- So the current results are partly constrained by backbone availability, not just by prompt or masking design
+
+---
+
 ## Main Research Tension Right Now
 
 We currently know:
