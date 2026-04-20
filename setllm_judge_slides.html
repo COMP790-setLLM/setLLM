@@ -1,0 +1,940 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Study of setLLM: permutation invariant PE and mask</title>
+  <style>
+    :root {
+      --slide-width: 1280px;
+      --slide-height: 720px;
+      --paper: linear-gradient(135deg, #f7f3ea 0%, #eef4f1 100%);
+      --ink: #1f2937;
+      --teal: #0f3d3e;
+      --accent: #7c3f00;
+      --line: #9eb3a7;
+      --table-head: #d9e8df;
+    }
+    * {
+      box-sizing: border-box;
+    }
+    html, body {
+      margin: 0;
+      height: 100%;
+      background: #111827;
+      font-family: "Aptos", "Segoe UI", sans-serif;
+      overflow: hidden;
+    }
+    body {
+      color: var(--ink);
+    }
+    .viewer {
+      position: fixed;
+      inset: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 0;
+    }
+    .deck {
+      position: relative;
+      width: var(--slide-width);
+      height: var(--slide-height);
+      transform-origin: center center;
+    }
+    .slide {
+      position: absolute;
+      inset: 0;
+      display: none;
+      background: var(--paper);
+      padding: 48px 56px;
+      overflow: hidden;
+      box-shadow: 0 28px 70px rgba(0, 0, 0, 0.35);
+      font-size: 29px;
+    }
+    .slide.active {
+      display: block;
+    }
+    .slide-content {
+      position: relative;
+      z-index: 2;
+      height: 100%;
+    }
+    .slide-content.constrained {
+      width: calc(100% - var(--bg-width) - 24px);
+    }
+    .slide.method-variants .slide-content {
+      width: 100%;
+    }
+    .slide.method-variants .method-layout {
+      display: grid;
+      grid-template-columns: minmax(0, 1.08fr) minmax(0, 0.92fr);
+      gap: 26px;
+      align-items: start;
+    }
+    .slide.method-variants .method-left {
+      min-width: 0;
+    }
+    .slide.method-variants .method-right {
+      min-width: 0;
+      display: grid;
+      grid-template-rows: repeat(2, minmax(0, 1fr));
+      gap: 16px;
+      align-content: start;
+      padding-top: 10px;
+    }
+    .slide.method-variants .method-right p {
+      margin: 0;
+      width: 100%;
+      height: 100%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .slide.method-variants .method-right img {
+      width: 100%;
+      height: 100%;
+      max-height: none;
+      object-fit: contain;
+      display: block;
+      background: rgba(255, 255, 255, 0.72);
+      border-radius: 14px;
+      padding: 8px;
+      box-shadow: 0 10px 24px rgba(15, 61, 62, 0.10);
+    }
+    .slide.method-variants table {
+      font-size: 0.64em;
+      margin-top: 0.35em;
+      margin-bottom: 0.55em;
+    }
+    .slide.method-variants p,
+    .slide.method-variants li,
+    .slide.method-variants td,
+    .slide.method-variants th {
+      line-height: 1.24;
+    }
+    .slide.method-variants ul {
+      margin-top: 0.2em;
+    }
+    .bg-panel {
+      position: absolute;
+      top: 0;
+      bottom: 0;
+      width: var(--bg-width);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 48px 36px;
+      z-index: 1;
+    }
+    .bg-right .bg-panel {
+      right: 0;
+    }
+    .bg-left .bg-panel {
+      left: 0;
+    }
+    .bg-image {
+      width: 100%;
+      height: 100%;
+      object-position: center center;
+      filter: drop-shadow(0 10px 18px rgba(0, 0, 0, 0.18));
+    }
+    .bg-contain {
+      object-fit: contain;
+    }
+    .bg-cover {
+      object-fit: cover;
+    }
+    .slide-page {
+      position: absolute;
+      right: 24px;
+      bottom: 18px;
+      color: rgba(31, 41, 55, 0.65);
+      font-size: 20px;
+      z-index: 3;
+    }
+    h1, h2, h3 {
+      color: var(--teal);
+      font-weight: 700;
+      margin-top: 0;
+    }
+    h1 {
+      font-size: 1.9em;
+      letter-spacing: -0.02em;
+      margin-bottom: 0.34em;
+      line-height: 1.08;
+    }
+    h2 {
+      font-size: 1.35em;
+      margin-bottom: 0.28em;
+    }
+    p, li, td, th {
+      font-size: 0.9em;
+      line-height: 1.32;
+    }
+    strong {
+      color: var(--accent);
+    }
+    code {
+      background: rgba(15, 61, 62, 0.08);
+      padding: 0.08em 0.24em;
+      border-radius: 0.2em;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      white-space: pre-wrap;
+    }
+    pre {
+      background: rgba(15, 61, 62, 0.08);
+      padding: 14px 16px;
+      border-radius: 10px;
+      overflow: hidden;
+      margin: 0.8em 0;
+    }
+    pre code {
+      background: transparent;
+      padding: 0;
+      border-radius: 0;
+      white-space: pre-wrap;
+    }
+    blockquote {
+      border-left: 6px solid #d08c3f;
+      background: rgba(208, 140, 63, 0.10);
+      padding: 0.5em 0.8em;
+      margin-left: 0;
+      margin-right: 0;
+    }
+    ul, ol {
+      margin-top: 0.4em;
+      margin-bottom: 0.6em;
+      padding-left: 1.25em;
+    }
+    li + li {
+      margin-top: 0.16em;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      table-layout: fixed;
+      font-size: 0.72em;
+      margin: 0.6em 0 0.8em;
+    }
+    th {
+      background: var(--table-head);
+    }
+    td, th {
+      padding: 0.35em 0.5em;
+      border: 1px solid var(--line);
+      vertical-align: top;
+      overflow-wrap: anywhere;
+      word-break: break-word;
+    }
+    img {
+      max-width: 100%;
+    }
+    .title-slide .slide-content {
+      padding-top: 8px;
+      max-width: 1040px;
+    }
+    .title-slide h1 {
+      font-size: 2.35em;
+      line-height: 1.06;
+      margin-bottom: 0.7em;
+      max-width: 1000px;
+    }
+    .title-slide p {
+      font-size: 1.02em;
+      margin-bottom: 0.7em;
+    }
+    .title-slide ul {
+      margin-top: 0.3em;
+    }
+    .title-slide li {
+      font-size: 1.0em;
+      line-height: 1.34;
+    }
+    .controls {
+      position: fixed;
+      left: 50%;
+      bottom: 16px;
+      transform: translateX(-50%);
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 10px 14px;
+      border-radius: 14px;
+      background: rgba(17, 24, 39, 0.8);
+      color: #fff;
+      z-index: 10;
+      backdrop-filter: blur(8px);
+      box-shadow: 0 12px 30px rgba(0, 0, 0, 0.28);
+    }
+    .controls button {
+      appearance: none;
+      border: 0;
+      background: rgba(255, 255, 255, 0.12);
+      color: #fff;
+      border-radius: 10px;
+      padding: 10px 14px;
+      font: inherit;
+      cursor: pointer;
+    }
+    .controls button:hover {
+      background: rgba(255, 255, 255, 0.20);
+    }
+    .controls .counter {
+      min-width: 96px;
+      text-align: center;
+      font-size: 14px;
+      opacity: 0.92;
+    }
+  </style>
+</head>
+<body>
+  <div class="viewer">
+    <div class="deck" id="deck">
+      
+    <section class="slide title-slide" data-index="0">
+      <div class="slide-page">1 / 18</div>
+      
+      <div class="slide-content">
+        <h1 id="study-of-setllm-permutation-invariant-pe-and-mask">Study of
+setLLM: permutation invariant PE and mask</h1>
+<p>Extending Set-LLM from MCQ invariance to open-ended pairwise
+judging</p>
+<ul>
+<li>Project: <code>setLLM</code></li>
+<li>Current base path: pairwise <code>LLM-as-a-judge</code></li>
+<li>Core comparison: <code>vanilla</code> vs <code>setllm</code> vs
+<code>setcausal</code></li>
+</ul>
+      </div>
+    </section>
+    
+    <section class="slide" data-index="1">
+      <div class="slide-page">2 / 18</div>
+      
+      <div class="slide-content">
+        <h2 id="motivation">Motivation</h2>
+<ul>
+<li>Pairwise LLM judges are often sensitive to whether a candidate
+appears as <code>A</code> or <code>B</code></li>
+<li>Protocol fixes such as judging both orders increase inference
+cost</li>
+<li>Set-LLM already shows permutation invariance on MCQ benchmarks</li>
+<li>The open question: <strong>does architectural invariance still help
+when each set element is a long multi-paragraph response?</strong></li>
+</ul>
+<blockquote>
+<p>Working hypothesis: for long judge responses, <code>setcausal</code>
+may be a better inductive bias than full prompt-side
+<code>SetMask</code>, because all SOTA LLMs are decoder-only and trained
+with casual mask.</p>
+</blockquote>
+      </div>
+    </section>
+    
+    <section class="slide" data-index="2">
+      <div class="slide-page">3 / 18</div>
+      
+      <div class="slide-content">
+        <h2 id="project-question">Project Question</h2>
+<p>We frame the paper around one main question:</p>
+<p><strong>Can architecture-level permutation invariance for open-ended
+pairwise judging match strong debiasing baselines at lower
+cost?</strong></p>
+<ul>
+<li>Input: shared prompt + unordered set of candidate responses</li>
+<li>Output: judge label <code>A</code>, <code>B</code>, or
+<code>Tie</code></li>
+<li>Goal: improve robustness without paying multi-order inference
+cost</li>
+</ul>
+      </div>
+    </section>
+    
+    <section class="slide method-variants" data-index="3">
+      <div class="slide-page">4 / 18</div>
+      
+      <div class="slide-content">
+        <h2 id="method-variants">Method Variants</h2>
+<div class="method-layout">
+<div class="method-left">
+
+<table>
+<thead>
+<tr class="header">
+<th>Variant</th>
+<th>Prompt attention inside a response</th>
+<th>Cross-response attention</th>
+<th>Intended role</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><code>vanilla</code></td>
+<td>standard decoder causal</td>
+<td>allowed through normal prompt order</td>
+<td>baseline</td>
+</tr>
+<tr class="even">
+<td><code>setllm</code></td>
+<td>SetPE + paper-style SetMask</td>
+<td>blocked</td>
+<td>original Set-LLM adaptation</td>
+</tr>
+<tr class="odd">
+<td><code>setcausal</code></td>
+<td>decoder causal within each response</td>
+<td>blocked</td>
+<td>long-response judge variant</td>
+</tr>
+</tbody>
+</table>
+<ul>
+<li><code>setcausal</code> keeps the prompt decoder-style while
+preventing response leakage</li>
+<li>This stays closer to decoder-only pretraining than full prompt-side
+SetMask</li>
+</ul>
+</div>
+<div class="method-right">
+
+<p><img src="attention.png" alt="Set-LLM mask transition diagram" /></p>
+<p><img src="example.png" alt="Example diagram" /></p>
+</div>
+</div>
+      </div>
+    </section>
+    
+    <section class="slide" data-index="4">
+      <div class="slide-page">5 / 18</div>
+      
+      <div class="slide-content">
+        <h2 id="how-we-turn-pairwise-judging-into-a-set-input">How We Turn
+Pairwise Judging into a Set Input</h2>
+<ul>
+<li>Each example has:
+<ul>
+<li>one <strong>shared user prompt</strong></li>
+<li>two <strong>candidate responses</strong></li>
+</ul></li>
+<li>We serialize them as:
+<ul>
+<li>shared prompt prefix</li>
+<li>candidate response 1 as one set element</li>
+<li>candidate response 2 as another set element</li>
+</ul></li>
+<li>The two responses should be treated as an <strong>unordered
+set</strong></li>
+<li>Desired behavior:
+<ul>
+<li>swapping the two responses should only swap the prediction
+label</li>
+<li>the internal score geometry should stay symmetric</li>
+</ul></li>
+</ul>
+      </div>
+    </section>
+    
+    <section class="slide" data-index="5">
+      <div class="slide-page">6 / 18</div>
+      
+      <div class="slide-content">
+        <h2 id="what-setllm-changes">What <code>setllm</code> Changes</h2>
+<ul>
+<li><code>setllm</code> keeps the original Set-LLM idea:
+<ul>
+<li>add <strong>SetPE</strong> so sibling elements do not depend on
+presentation order</li>
+<li>use <strong>SetMask</strong> to block direct attention across
+different candidates</li>
+</ul></li>
+<li>Inside one candidate response:
+<ul>
+<li>prompt-side tokens can still attend bidirectionally within the
+element</li>
+</ul></li>
+<li>Across two different candidates:
+<ul>
+<li>attention is blocked, so one answer cannot directly leak into the
+other</li>
+</ul></li>
+</ul>
+<p>Intuition:</p>
+<ul>
+<li>candidate A and candidate B both read the same shared prompt</li>
+<li>but neither candidate can "peek" at the other's response tokens</li>
+<li>this removes many order shortcuts that exist in vanilla decoder
+prompts</li>
+</ul>
+      </div>
+    </section>
+    
+    <section class="slide" data-index="6">
+      <div class="slide-page">7 / 18</div>
+      
+      <div class="slide-content">
+        <h2 id="what-setcausal-changes">What <code>setcausal</code> Changes</h2>
+<ul>
+<li><code>setcausal</code> keeps the same high-level set decomposition:
+<ul>
+<li>shared prompt</li>
+<li>isolated candidate elements</li>
+</ul></li>
+<li>But <strong>inside each candidate</strong>, it restores a
+decoder-style <strong>causal</strong> mask</li>
+<li>So <code>setcausal</code> is:
+<ul>
+<li>set-aware <strong>across</strong> responses</li>
+<li>causal <strong>within</strong> each response</li>
+</ul></li>
+</ul>
+<p>Why this matters:</p>
+<ul>
+<li>modern judge backbones are decoder-only LLMs</li>
+<li>they were pretrained with causal next-token prediction</li>
+<li>long multi-turn responses may therefore be represented more
+naturally by a causal local mask than by full prompt-side bidirectional
+visibility</li>
+</ul>
+      </div>
+    </section>
+    
+    <section class="slide" data-index="7">
+      <div class="slide-page">8 / 18</div>
+      
+      <div class="slide-content">
+        <h2 id="setllm-vs-setcausal"><code>setllm</code> vs
+<code>setcausal</code></h2>
+<table>
+<thead>
+<tr class="header">
+<th>Property</th>
+<th><code>setllm</code></th>
+<th><code>setcausal</code></th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Candidate isolation</td>
+<td>yes</td>
+<td>yes</td>
+</tr>
+<tr class="even">
+<td>Uses SetPE</td>
+<td>yes</td>
+<td>yes</td>
+</tr>
+<tr class="odd">
+<td>Cross-response leakage blocked</td>
+<td>yes</td>
+<td>yes</td>
+</tr>
+<tr class="even">
+<td>Within-response mask</td>
+<td>prompt-side SetMask</td>
+<td>decoder causal</td>
+</tr>
+<tr class="odd">
+<td>Closest to original Set-LLM paper</td>
+<td>yes</td>
+<td>partial</td>
+</tr>
+<tr class="even">
+<td>Closest to decoder pretraining</td>
+<td>weaker</td>
+<td>stronger</td>
+</tr>
+</tbody>
+</table>
+<p>Working interpretation:</p>
+<ul>
+<li><code>setllm</code> is the most faithful adaptation of the paper
+design</li>
+<li><code>setcausal</code> is the judge-specific variant we introduced
+for long responses</li>
+<li>the empirical question is not only "which is more invariant"</li>
+<li>it is also "which inductive bias better matches long-form
+judging"</li>
+</ul>
+      </div>
+    </section>
+    
+    <section class="slide" data-index="8">
+      <div class="slide-page">9 / 18</div>
+      
+      <div class="slide-content">
+        <h2 id="set-llm-paper-reproduction-result">Set-LLM Paper Reproduction
+Result</h2>
+<p>Before the judge experiments, the repo reproduced the paper-style MCQ
+setting with Gemma 2B.</p>
+<table>
+<thead>
+<tr class="header">
+<th>Method</th>
+<th style="text-align: right;">ARC</th>
+<th style="text-align: right;">CSQA</th>
+<th style="text-align: right;">PIQA</th>
+<th style="text-align: right;">SIQA</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><code>setllm</code></td>
+<td style="text-align: right;"><code>56.52 / 56.52</code></td>
+<td style="text-align: right;"><code>76.90 / 76.90</code></td>
+<td style="text-align: right;"><code>85.20 / 85.20</code></td>
+<td style="text-align: right;"><code>76.25 / 76.25</code></td>
+</tr>
+<tr class="even">
+<td><code>setcausal</code></td>
+<td style="text-align: right;"><code>51.51 / 51.51</code></td>
+<td style="text-align: right;"><code>75.27 / 75.27</code></td>
+<td style="text-align: right;"><code>81.01 / 81.01</code></td>
+<td style="text-align: right;"><code>75.9 / 75.9</code></td>
+</tr>
+<tr class="odd">
+<td>paper <code>Set-LLM + PEUltra</code></td>
+<td style="text-align: right;"><code>65.02 / 65.02</code></td>
+<td style="text-align: right;"><code>80.18 / 80.18</code></td>
+<td style="text-align: right;"><code>85.80 / 85.80</code></td>
+<td style="text-align: right;"><code>76.15 / 76.15</code></td>
+</tr>
+<tr class="even">
+<td>paper <code>Causal Mask + PEUltra</code></td>
+<td style="text-align: right;"><code>56.32 / 26.88</code></td>
+<td style="text-align: right;"><code>77.89 / 68.47</code></td>
+<td style="text-align: right;"><code>83.98 / 77.31</code></td>
+<td style="text-align: right;"><code>74.33 / 63.97</code></td>
+</tr>
+</tbody>
+</table>
+<ul>
+<li>numbers are <code>random / adversarial</code> accuracy</li>
+<li>reproduced <code>setllm</code>/<code>set-casual</code> keeps full
+adversarial-order robustness across all four MCQ benchmarks and
+<code>set-casual</code> underperforms</li>
+<li>reproduced <code>setllm</code> is close to the paper
+<code>Set-LLM + PEUltra</code> result on <code>PIQA</code> and
+<code>SIQA</code>, but still below it on <code>ARC</code> and
+<code>CSQA</code></li>
+<li>the likely reason the reproduction is weaker is that this repo does
+not include the paper's UltraFeedback extra-pretraining stage</li>
+</ul>
+      </div>
+    </section>
+    
+    <section class="slide scope" data-index="9">
+      <div class="slide-page">10 / 18</div>
+      
+      <div class="slide-content">
+        <h2 id="current-experimental-scope">Current Experimental Scope</h2>
+<ul>
+<li><strong>Task:</strong> pairwise judging</li>
+<li><strong>Datasets prepared or targeted:</strong> JudgeBench,
+MT-Bench</li>
+<li><strong>Training:</strong> LoRA on decoder-only HF models, currently
+Gemma 2B, Gemma 7B, Qwen 3.5</li>
+<li><strong>Compute:</strong> Vast.ai remote GPUs, W&amp;B for
+tracking</li>
+</ul>
+<p>Key metrics in the current pipeline:</p>
+<ul>
+<li><code>accuracy</code></li>
+<li><code>swap_consistency</code>: fraction of examples where the
+judgment stays the same after swapping response order</li>
+<li><code>first_position_win_rate</code>: fraction of original-order
+prompts where the model chooses the response shown first</li>
+<li><code>swapped_first_position_win_rate</code>: fraction of
+swapped-order prompts where the model still chooses the response shown
+first in that swapped presentation</li>
+</ul>
+      </div>
+    </section>
+    
+    <section class="slide" data-index="10">
+      <div class="slide-page">11 / 18</div>
+      
+      <div class="slide-content">
+        <h2 id="new-update-judgebench-prompt-ablations">New Update: JudgeBench
+Prompt Ablations</h2>
+<p>Labeling problems for long choices(agent response).</p>
+<p>All JudgeBench results below use the <strong>corrected</strong>
+<code>setcausal</code> mask semantics.</p>
+<ul>
+<li>Early eval used the negative log likelihood of the single output
+token <code>A</code> or <code>B</code>; Gemma 2B showed a strong prior
+bias toward <code>A</code></li>
+<li>Scoring by the summed negative log likelihood of an entire choice
+body instead makes the model prefer shorter choices, so length bias
+replaces token bias</li>
+<li>We use the hash value of choice as its label: H_XXXX to mitigate
+label bias. (We cannot use <code>Tie</code> token anymore because the
+model prefers <code>Tie</code> much more over hash labels).</li>
+<li>In the main prompt, if both hash shows up like "which is better:
+H_1234 or H_8978", the model prefer the label that shows up first. So we
+have to use "which is better: H_" as the instruction.</li>
+<li>After all these fixes, the distribution of choices made by the model
+is much more balanced.</li>
+</ul>
+<p>Main lesson:</p>
+<ul>
+<li>Need to be carefull to remove any imposed asymmetry.</li>
+</ul>
+      </div>
+    </section>
+    
+    <section class="slide" data-index="11">
+      <div class="slide-page">12 / 18</div>
+      
+      <div class="slide-content">
+        <h2 id="judgebench-hlabelprompt-results">JudgeBench:
+<code>hlabelprompt</code> Results</h2>
+<table>
+<thead>
+<tr class="header">
+<th>Model</th>
+<th style="text-align: right;">Accuracy</th>
+<th style="text-align: right;">Adversarial Order Acc.</th>
+<th style="text-align: right;">Swap Consistency</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><code>vanilla</code></td>
+<td style="text-align: right;"><code>0.48794</code></td>
+<td style="text-align: right;"><code>0.20107</code></td>
+<td style="text-align: right;"><code>0.39678</code></td>
+</tr>
+<tr class="even">
+<td><code>setllm</code></td>
+<td style="text-align: right;"><code>0.50134</code></td>
+<td style="text-align: right;"><code>0.50134</code></td>
+<td style="text-align: right;"><code>1.0</code></td>
+</tr>
+<tr class="odd">
+<td><code>setcausal</code></td>
+<td style="text-align: right;"><code>0.45576</code></td>
+<td style="text-align: right;"><code>0.45576</code></td>
+<td style="text-align: right;"><code>1.0</code></td>
+</tr>
+</tbody>
+</table>
+<p>Takeaway:</p>
+<ul>
+<li>removing explicit label-order instructions removed an old shortcut
+in the prompt</li>
+<li><code>setllm</code> is now the strongest model on this cleaner
+JudgeBench prompt</li>
+<li>corrected <code>setcausal</code> becomes fully invariant here, but
+with weaker raw accuracy than <code>setllm</code></li>
+<li>We ran it with different random seeds but setcasual remains to be
+the worse at 1000 optimization steps.</li>
+</ul>
+      </div>
+    </section>
+    
+    <section class="slide" data-index="12">
+      <div class="slide-page">13 / 18</div>
+      
+      <div class="slide-content">
+        <h2 id="judgebench-answerlabel-results">JudgeBench:
+<code>answerlabel</code> Results</h2>
+<table>
+<thead>
+<tr class="header">
+<th>Model</th>
+<th style="text-align: right;">Accuracy</th>
+<th style="text-align: right;">Adversarial Order Acc.</th>
+<th style="text-align: right;">Swap Consistency</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><code>vanilla</code></td>
+<td style="text-align: right;"><code>0.49598</code></td>
+<td style="text-align: right;"><code>0.17962</code></td>
+<td style="text-align: right;"><code>0.35121</code></td>
+</tr>
+<tr class="even">
+<td><code>setllm</code></td>
+<td style="text-align: right;"><code>0.47721</code></td>
+<td style="text-align: right;"><code>0.47721</code></td>
+<td style="text-align: right;"><code>1.0</code></td>
+</tr>
+<tr class="odd">
+<td><code>setcausal</code></td>
+<td style="text-align: right;"><code>0.48257</code></td>
+<td style="text-align: right;"><code>0.48257</code></td>
+<td style="text-align: right;"><code>1.0</code></td>
+</tr>
+</tbody>
+</table>
+<p>Takeaway:</p>
+<ul>
+<li>repeating the label after each response helps corrected
+<code>setcausal</code> recover accuracy</li>
+<li>this supports a <strong>label-to-response binding</strong>
+hypothesis for long decoder-style prompts</li>
+<li>the same redundancy slightly hurts <code>setllm</code>, so the best
+prompt may differ by architecture</li>
+</ul>
+      </div>
+    </section>
+    
+    <section class="slide" data-index="13">
+      <div class="slide-page">14 / 18</div>
+      
+      <div class="slide-content">
+        <h2 id="judgebench-reproducibility-signal">JudgeBench Reproducibility
+Signal</h2>
+<p><code>answerlabel</code>, seed <code>42</code> vs
+<code>123</code>:</p>
+<ul>
+<li><code>vanilla</code>: <code>0.49598 -&gt; 0.49598</code></li>
+<li><code>setllm</code>: <code>0.47721 -&gt; 0.48525</code></li>
+<li><code>setcausal</code>: <code>0.48257 -&gt; 0.47989</code></li>
+</ul>
+<p>Current read:</p>
+<ul>
+<li>the corrected invariant comparisons are fairly stable across two
+seeds</li>
+<li><code>vanilla</code> still has the highest clean accuracy, but poor
+adversarial robustness and much lower consistency</li>
+<li><code>setllm</code> and <code>setcausal</code> are now close enough
+that prompt design may decide the winner</li>
+</ul>
+      </div>
+    </section>
+    
+    <section class="slide" data-index="14">
+      <div class="slide-page">15 / 18</div>
+      
+      <div class="slide-content">
+        <h2 id="main-research-tension-right-now">Main Research Tension Right
+Now</h2>
+<p>We currently know:</p>
+<ul>
+<li><code>setcausal</code> is conceptually appealing for long
+responses</li>
+<li>the old <code>setcausal</code> mask was wrong and has now been
+corrected</li>
+<li>earlier <code>setcausal</code> results are therefore not
+apples-to-apples with corrected runs</li>
+<li>corrected JudgeBench runs now show <code>setcausal</code> can reach
+<code>swap_consistency = 1.0</code></li>
+<li>but <code>setllm</code> is still stronger on raw accuracy under the
+best current prompt</li>
+</ul>
+<p>So the real question is now:</p>
+<p><strong>Can we improve corrected <code>setcausal</code> label binding
+enough to keep full invariance while closing the clean-accuracy gap to
+<code>setllm</code> and <code>vanilla</code>?</strong></p>
+      </div>
+    </section>
+    
+    <section class="slide" data-index="15">
+      <div class="slide-page">16 / 18</div>
+      
+      <div class="slide-content">
+        <h2 id="near-term-plan">Near-Term Plan</h2>
+<ul>
+<li>Run stronger matched ablations on MT-Bench and JudgeBench with the
+corrected <code>setcausal</code> mask</li>
+<li>Run stroger models like gemma4B</li>
+<li>Treat prompt format as an explicit ablation axis, not just
+implementation detail</li>
+<li>Bring in Chatbot Arena for scale and human-preference
+correlation</li>
+<li>Add adversarial attacks: whitespace, confident preamble, verbosity,
+paragraph reorder</li>
+</ul>
+<p>Success condition:</p>
+<ul>
+<li>a single-pass invariant judge is competitive with multi-order
+baselines at lower cost</li>
+</ul>
+      </div>
+    </section>
+    
+    <section class="slide" data-index="16">
+      <div class="slide-page">17 / 18</div>
+      
+      <div class="slide-content">
+        <h2 id="paper-framing">Paper Framing</h2>
+<p>Recommended title direction:</p>
+<p><strong>Set-Causal LLM Judges: Permutation-Invariant Open-Ended
+Pairwise Evaluation</strong></p>
+<p>Core contribution story:</p>
+<ol type="1">
+<li>Formulate pairwise judging as a set of structured sequences</li>
+<li>Compare <code>vanilla</code>, <code>SetPE + SetMask</code>, and
+<code>SetPE + setcausal</code></li>
+<li>Prove permutation equivariance for the set-aware architecture</li>
+<li>Test robustness-cost tradeoffs against inference-time debiasing
+baselines</li>
+</ol>
+      </div>
+    </section>
+    
+    <section class="slide" data-index="17">
+      <div class="slide-page">18 / 18</div>
+      
+      <div class="slide-content">
+        <h2 id="bottom-line">Bottom Line</h2>
+<ul>
+<li>The infrastructure is working and the project has a real empirical
+target</li>
+<li>Position bias is clearly present in open-ended judging</li>
+<li>Early results are informative but still too small for scientific
+conclusions</li>
+</ul>
+      </div>
+    </section>
+    
+    </div>
+  </div>
+  <div class="controls">
+    <button id="prev" aria-label="Previous slide">Prev</button>
+    <div class="counter" id="counter"></div>
+    <button id="next" aria-label="Next slide">Next</button>
+  </div>
+  <script>
+    const slides = Array.from(document.querySelectorAll('.slide'));
+    const counter = document.getElementById('counter');
+    const deck = document.getElementById('deck');
+    let current = 0;
+
+    function updateScale() {
+      const maxW = window.innerWidth;
+      const maxH = window.innerHeight;
+      const scale = Math.min(maxW / 1280, maxH / 720);
+      deck.style.transform = `scale(${scale})`;
+    }
+
+    function show(index) {
+      current = (index + slides.length) % slides.length;
+      slides.forEach((slide, i) => slide.classList.toggle('active', i === current));
+      counter.textContent = `${current + 1} / ${slides.length}`;
+    }
+
+    document.getElementById('prev').addEventListener('click', () => show(current - 1));
+    document.getElementById('next').addEventListener('click', () => show(current + 1));
+    window.addEventListener('resize', updateScale);
+    window.addEventListener('keydown', (event) => {
+      if (['ArrowRight', 'PageDown', ' '].includes(event.key)) {
+        event.preventDefault();
+        show(current + 1);
+      }
+      if (['ArrowLeft', 'PageUp'].includes(event.key)) {
+        event.preventDefault();
+        show(current - 1);
+      }
+      if (event.key === 'Home') show(0);
+      if (event.key === 'End') show(slides.length - 1);
+    });
+
+    updateScale();
+    show(0);
+  </script>
+</body>
+</html>
