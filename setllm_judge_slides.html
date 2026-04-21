@@ -293,7 +293,7 @@
     <div class="deck" id="deck">
       
     <section class="slide title-slide" data-index="0">
-      <div class="slide-page">1 / 18</div>
+      <div class="slide-page">1 / 20</div>
       
       <div class="slide-content">
         <h1 id="study-of-setllm-permutation-invariant-pe-and-mask">Study of
@@ -310,7 +310,7 @@ judging</p>
     </section>
     
     <section class="slide" data-index="1">
-      <div class="slide-page">2 / 18</div>
+      <div class="slide-page">2 / 20</div>
       
       <div class="slide-content">
         <h2 id="motivation">Motivation</h2>
@@ -333,7 +333,7 @@ with casual mask.</p>
     </section>
     
     <section class="slide" data-index="2">
-      <div class="slide-page">3 / 18</div>
+      <div class="slide-page">3 / 20</div>
       
       <div class="slide-content">
         <h2 id="project-question">Project Question</h2>
@@ -352,7 +352,7 @@ cost</li>
     </section>
     
     <section class="slide method-variants" data-index="3">
-      <div class="slide-page">4 / 18</div>
+      <div class="slide-page">4 / 20</div>
       
       <div class="slide-content">
         <h2 id="method-variants">Method Variants</h2>
@@ -398,15 +398,15 @@ SetMask</li>
 </div>
 <div class="method-right">
 
-<p><img src="attention.png" alt="Set-LLM mask transition diagram" /></p>
-<p><img src="example.png" alt="Example diagram" /></p>
+<p><img src="https://raw.githubusercontent.com/COMP790-setLLM/setLLM/paper_neurips_full/attention.png" alt="Set-LLM mask transition diagram" /></p>
+<p><img src="https://raw.githubusercontent.com/COMP790-setLLM/setLLM/paper_neurips_full/example.png" alt="Example diagram" /></p>
 </div>
 </div>
       </div>
     </section>
     
     <section class="slide" data-index="4">
-      <div class="slide-page">5 / 18</div>
+      <div class="slide-page">5 / 20</div>
       
       <div class="slide-content">
         <h2 id="how-we-turn-pairwise-judging-into-a-set-input">How We Turn
@@ -436,7 +436,7 @@ label</li>
     </section>
     
     <section class="slide" data-index="5">
-      <div class="slide-page">6 / 18</div>
+      <div class="slide-page">6 / 20</div>
       
       <div class="slide-content">
         <h2 id="what-setllm-changes">What <code>setllm</code> Changes</h2>
@@ -470,7 +470,7 @@ prompts</li>
     </section>
     
     <section class="slide" data-index="6">
-      <div class="slide-page">7 / 18</div>
+      <div class="slide-page">7 / 20</div>
       
       <div class="slide-content">
         <h2 id="what-setcausal-changes">What <code>setcausal</code> Changes</h2>
@@ -500,7 +500,7 @@ visibility</li>
     </section>
     
     <section class="slide" data-index="7">
-      <div class="slide-page">8 / 18</div>
+      <div class="slide-page">8 / 20</div>
       
       <div class="slide-content">
         <h2 id="setllm-vs-setcausal"><code>setllm</code> vs
@@ -560,7 +560,7 @@ judging"</li>
     </section>
     
     <section class="slide" data-index="8">
-      <div class="slide-page">9 / 18</div>
+      <div class="slide-page">9 / 20</div>
       
       <div class="slide-content">
         <h2 id="set-llm-paper-reproduction-result">Set-LLM Paper Reproduction
@@ -624,7 +624,7 @@ not include the paper's UltraFeedback extra-pretraining stage</li>
     </section>
     
     <section class="slide scope" data-index="9">
-      <div class="slide-page">10 / 18</div>
+      <div class="slide-page">10 / 20</div>
       
       <div class="slide-content">
         <h2 id="current-experimental-scope">Current Experimental Scope</h2>
@@ -652,7 +652,7 @@ first in that swapped presentation</li>
     </section>
     
     <section class="slide" data-index="10">
-      <div class="slide-page">11 / 18</div>
+      <div class="slide-page">11 / 20</div>
       
       <div class="slide-content">
         <h2 id="new-update-judgebench-prompt-ablations">New Update: JudgeBench
@@ -684,7 +684,7 @@ is much more balanced.</li>
     </section>
     
     <section class="slide" data-index="11">
-      <div class="slide-page">12 / 18</div>
+      <div class="slide-page">12 / 20</div>
       
       <div class="slide-content">
         <h2 id="judgebench-hlabelprompt-results">JudgeBench:
@@ -734,7 +734,7 @@ the worse at 1000 optimization steps.</li>
     </section>
     
     <section class="slide" data-index="12">
-      <div class="slide-page">13 / 18</div>
+      <div class="slide-page">13 / 20</div>
       
       <div class="slide-content">
         <h2 id="judgebench-answerlabel-results">JudgeBench:
@@ -782,7 +782,7 @@ prompt may differ by architecture</li>
     </section>
     
     <section class="slide" data-index="13">
-      <div class="slide-page">14 / 18</div>
+      <div class="slide-page">14 / 20</div>
       
       <div class="slide-content">
         <h2 id="judgebench-reproducibility-signal">JudgeBench Reproducibility
@@ -807,7 +807,79 @@ that prompt design may decide the winner</li>
     </section>
     
     <section class="slide" data-index="14">
-      <div class="slide-page">15 / 18</div>
+      <div class="slide-page">15 / 20</div>
+      
+      <div class="slide-content">
+        <h2 id="mt-bench-early-matched-results">MT-Bench: Early Matched
+Results</h2>
+<table>
+<thead>
+<tr class="header">
+<th>arch</th>
+<th style="text-align: right;">acc</th>
+<th style="text-align: right;">swap_consist</th>
+<th style="text-align: right;">first_pos_win</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><code>vanilla</code></td>
+<td style="text-align: right;"><code>0.396</code></td>
+<td style="text-align: right;"><code>0.484</code></td>
+<td style="text-align: right;"><code>0.359</code></td>
+</tr>
+<tr class="even">
+<td><code>setllm</code></td>
+<td style="text-align: right;"><code>0.390</code></td>
+<td style="text-align: right;"><code>1.000</code></td>
+<td style="text-align: right;"><code>0.515 (collapse)</code></td>
+</tr>
+<tr class="odd">
+<td><code>setcausal</code></td>
+<td style="text-align: right;"><code>0.417</code></td>
+<td style="text-align: right;"><code>1.000</code></td>
+<td style="text-align: right;"><code>0.357</code></td>
+</tr>
+</tbody>
+</table>
+<p>Takeaway:</p>
+<ul>
+<li><code>setcausal</code> is currently the best MT-Bench model on
+accuracy while preserving full swap consistency</li>
+<li>the absolute accuracy is still low, and the <code>0.417</code> vs
+<code>0.390</code> gap is too small to support a strong claim</li>
+<li>one likely explanation is that <strong>Gemma 2B may simply be too
+weak to act as a reliable LLM judge</strong> on MT-Bench</li>
+<li><code>setllm</code> remains invariant but shows a slot-1 collapse on
+this setup, so the next A/B diagnostic needs to separate hash-label
+artifacts from a deeper long-context failure</li>
+</ul>
+      </div>
+    </section>
+    
+    <section class="slide" data-index="15">
+      <div class="slide-page">16 / 20</div>
+      
+      <div class="slide-content">
+        <h2 id="failed-attempts-on-stronger-backbones">Failed Attempts on
+Stronger Backbones</h2>
+<ul>
+<li>We tried <code>Qwen3.5 2B</code>, but its hybrid attention stack
+uses recurrent / convolutional updates that are inherently
+<strong>sequence-order-sensitive</strong></li>
+<li>That makes it a poor fit for a clean permutation-invariant
+<code>setllm</code> evaluation, even before downstream tuning</li>
+<li>We also tried <code>Gemma 7B</code>, but <code>setllm</code>
+evaluation requires full precision and still <strong>OOMs on 48 GB
+VRAM</strong></li>
+<li>So the current results are partly constrained by backbone
+availability, not just by prompt or masking design</li>
+</ul>
+      </div>
+    </section>
+    
+    <section class="slide" data-index="16">
+      <div class="slide-page">17 / 20</div>
       
       <div class="slide-content">
         <h2 id="main-research-tension-right-now">Main Research Tension Right
@@ -832,8 +904,8 @@ enough to keep full invariance while closing the clean-accuracy gap to
       </div>
     </section>
     
-    <section class="slide" data-index="15">
-      <div class="slide-page">16 / 18</div>
+    <section class="slide" data-index="17">
+      <div class="slide-page">18 / 20</div>
       
       <div class="slide-content">
         <h2 id="near-term-plan">Near-Term Plan</h2>
@@ -856,8 +928,8 @@ baselines at lower cost</li>
       </div>
     </section>
     
-    <section class="slide" data-index="16">
-      <div class="slide-page">17 / 18</div>
+    <section class="slide" data-index="18">
+      <div class="slide-page">19 / 20</div>
       
       <div class="slide-content">
         <h2 id="paper-framing">Paper Framing</h2>
@@ -876,8 +948,8 @@ baselines</li>
       </div>
     </section>
     
-    <section class="slide" data-index="17">
-      <div class="slide-page">18 / 18</div>
+    <section class="slide" data-index="19">
+      <div class="slide-page">20 / 20</div>
       
       <div class="slide-content">
         <h2 id="bottom-line">Bottom Line</h2>
