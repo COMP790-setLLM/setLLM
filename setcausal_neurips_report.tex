@@ -1,0 +1,218 @@
+\documentclass{article}
+
+\usepackage[preprint]{neurips_2023}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{hyperref}
+\usepackage{url}
+\usepackage{booktabs}
+\usepackage{amsfonts}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{microtype}
+\usepackage{xcolor}
+\usepackage{graphicx}
+\usepackage{subcaption}
+\usepackage{enumitem}
+
+\setlist[itemize]{leftmargin=1.2em}
+
+\title{Set-Causal LLM Judges:\\Permutation-Invariant Open-Ended Pairwise Evaluation}
+
+\author{Anonymous Authors}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+Pairwise LLM judges are often sensitive to whether a candidate response is presented first or second. A simple protocol fix is to evaluate both orders, but that increases inference cost. We study whether architecture-level permutation handling can improve robustness in a single forward pass. We adapt the Set-LLM idea from multiple-choice invariance to open-ended pairwise judging and compare three variants: a standard causal baseline (\texttt{vanilla}), a Set-LLM-style adaptation with SetPE and SetMask (\texttt{setllm}), and a judge-oriented variant that restores decoder-style causal masking within each response while preserving cross-response isolation (\texttt{setcausal}). Two findings emerge. First, the MCQ reproduction stage confirms that the set-aware implementations preserve adversarial-order robustness, with \texttt{setllm} consistently stronger than \texttt{setcausal}. Second, on JudgeBench prompt ablations with the corrected \texttt{setcausal} mask, both \texttt{setllm} and \texttt{setcausal} can achieve perfect swap consistency, but raw accuracy depends strongly on prompt design. Under the cleaner \texttt{hlabelprompt} setting, \texttt{setllm} is strongest; under \texttt{answerlabel}, corrected \texttt{setcausal} recovers accuracy and moves much closer to \texttt{setllm}. Overall, architecture-level invariance clearly fixes order sensitivity, but prompt design remains a decisive factor for maintaining accuracy.
+\end{abstract}
+
+\section{Introduction}
+
+Open-ended pairwise LLM judges frequently change their decision when two candidate responses are swapped. This is undesirable because the underlying task is symmetric: the quality relation between two responses should not depend on which one happened to be written first. A common workaround is to run the judge on both candidate orders and combine the two outputs, but that doubles inference cost.
+
+We ask whether architecture-level permutation invariance for open-ended pairwise judging can match strong debiasing baselines at lower cost. The input is a shared user prompt together with two candidate responses that should be treated as an unordered set. The output is a three-way judgment, \texttt{A}, \texttt{B}, or \texttt{Tie}. The goal is to improve robustness without relying on multi-order inference.
+
+The work is grounded in Set-LLM, which already shows permutation invariance on multiple-choice question answering. The open question is whether the same idea still helps when each set element is a long multi-paragraph response. A natural hypothesis is that long-form judging may prefer a different inductive bias from the original SetMask design, because modern judge backbones are decoder-only models trained with causal next-token prediction. This motivates the comparison between the more faithful \texttt{setllm} adaptation and the judge-specific \texttt{setcausal} variant.
+
+An important methodological point is that prompt design itself can introduce asymmetry in open-ended judging. Label strings, scoring rules, and answer formatting can all create shortcuts that overwhelm the architectural comparison. For that reason, prompt ablations and architecture ablations must be treated as part of the same robustness story.
+
+\section{Method}
+
+Each pairwise judging example is decomposed into one shared prompt and two candidate responses. The two responses are serialized as sibling elements in an unordered set, while the shared prompt remains ordinary text. Desired behavior is straightforward: swapping the responses should only swap the predicted label, and the internal score geometry should remain symmetric.
+
+\begin{figure}[t]
+\centering
+\begin{subfigure}[t]{0.48\linewidth}
+\centering
+\includegraphics[width=\linewidth]{../../setLLM-master/attention.png}
+\caption{Set-mask transition diagram.}
+\end{subfigure}
+\hfill
+\begin{subfigure}[t]{0.48\linewidth}
+\centering
+\includegraphics[width=\linewidth]{../../setLLM-master/example.png}
+\caption{Example attention pattern illustration.}
+\end{subfigure}
+\caption{Visual summary of the set-aware judge formulation, copied directly from the Set-LLM paper. Candidate responses should read the shared prompt but not leak information directly to each other.}
+\label{fig:judge-visuals}
+\end{figure}
+
+\subsection{Architecture Variants}
+
+We compare three variants.
+
+\textbf{Vanilla.} This is the baseline decoder-only judge. Within one response, attention follows the standard causal mask, and cross-response interaction is implicitly allowed through the prompt order. The later response can therefore benefit from seeing the earlier one.
+
+\textbf{SetLLM.} This variant keeps the original Set-LLM adaptation. It adds Set Position Encoding (SetPE) so sibling elements do not depend on presentation order, and it applies SetMask to block direct attention across different candidate responses. Inside one candidate response, prompt-side tokens can still attend bidirectionally within the element.
+
+\textbf{SetCausal.} This is the judge-specific variant studied here. It keeps the same set decomposition and response-level isolation but restores a decoder-style causal mask within each candidate response. In other words, \texttt{setcausal} is set-aware across responses and causal within a response. The intended benefit is a better inductive bias for long-form decoder-only judging.
+
+Table~\ref{tab:method-summary} summarizes the architectural comparison.
+
+\begin{table}[t]
+\centering
+\small
+\begin{tabular}{llll}
+\toprule
+Variant & In-response mask & Cross-response & Role \\
+\midrule
+\texttt{vanilla} & decoder causal & allowed & baseline \\
+\texttt{setllm} & SetMask style & blocked & paper adaptation \\
+\texttt{setcausal} & decoder causal & blocked & judge variant \\
+\bottomrule
+\end{tabular}
+\caption{Method summary.}
+\label{tab:method-summary}
+\end{table}
+
+\subsection{Why \texttt{setcausal} Might Help}
+
+The comparison is not only about invariance. \texttt{setllm} is the most faithful adaptation of the original paper design, but \texttt{setcausal} is closer to decoder pretraining because all modern judge backbones are decoder-only models. For long multi-turn responses, this matters: a local causal mask may preserve the way the backbone was pretrained while still blocking response-to-response leakage. The empirical question is therefore two-fold: which architecture is more invariant, and which inductive bias better matches long-form judging.
+
+\section{Benchmark Sanity Check}
+
+Before running judge experiments, we reproduced the paper-style MCQ setting with Gemma 2B. This stage matters because it checks whether the current implementation still recovers the core Set-LLM behavior before moving to pairwise open-ended judging.
+
+\begin{table}[t]
+\centering
+\small
+\begin{tabular}{lcccc}
+\toprule
+Method & ARC & CSQA & PIQA & SIQA \\
+\midrule
+\texttt{setllm} & 56.52 / 56.52 & 76.90 / 76.90 & 85.20 / 85.20 & 76.25 / 76.25 \\
+\texttt{setcausal} & 51.51 / 51.51 & 75.27 / 75.27 & 81.01 / 81.01 & 75.90 / 75.90 \\
+paper Set-LLM + PEUltra & 65.02 / 65.02 & 80.18 / 80.18 & 85.80 / 85.80 & 76.15 / 76.15 \\
+paper Causal Mask + PEUltra & 56.32 / 26.88 & 77.89 / 68.47 & 83.98 / 77.31 & 74.33 / 63.97 \\
+\bottomrule
+\end{tabular}
+\caption{MCQ reproduction results. Each entry is random-order / adversarial-order accuracy.}
+\label{tab:mcq}
+\end{table}
+
+Two conclusions follow directly from Table~\ref{tab:mcq}. First, the reproduced \texttt{setllm} and \texttt{setcausal} variants maintain full adversarial-order robustness across all four benchmarks, because their random-order and adversarial-order numbers are identical. Second, \texttt{setcausal} underperforms \texttt{setllm} on all four tasks. This functions as a useful sanity check rather than a failure: the set-aware code path behaves as expected, and the more causal local mask does not obviously help in the short-answer MCQ regime.
+
+This background result motivates the transition to open-ended pairwise judging. If \texttt{setcausal} is weaker on short option-style tasks but conceptually better aligned with long responses, then pairwise judging is exactly the setting in which the two designs should be distinguished.
+
+\section{JudgeBench Prompt Ablations}
+
+The main results come from JudgeBench prompt ablations using the corrected \texttt{setcausal} mask semantics. The central issue is that long-form judging suffers from multiple label-related asymmetries.
+
+Early evaluation used the negative log likelihood of a single output token such as \texttt{A} or \texttt{B}, which introduced a strong label prior. Scoring by the summed negative log likelihood of an entire choice body removed that token bias but replaced it with a length bias, because the model preferred shorter choices. The labels were therefore changed to hashed forms such as \texttt{H\_XXXX}. This mitigated label bias but introduced another issue: when both labels were written explicitly in the main instruction, the model preferred whichever hash appeared first. The prompt was further simplified so that the instruction only referred generically to \texttt{H\_}. The main lesson is that any imposed asymmetry can contaminate the architecture comparison.
+
+\subsection{\texttt{hlabelprompt} Results}
+
+\begin{table}[t]
+\centering
+\small
+\begin{tabular}{lccc}
+\toprule
+Model & Accuracy & Adv. Order Acc. & Swap Consistency \\
+\midrule
+\texttt{vanilla} & 0.48794 & 0.20107 & 0.39678 \\
+\texttt{setllm} & \textbf{0.50134} & \textbf{0.50134} & \textbf{1.00000} \\
+\texttt{setcausal} & 0.45576 & 0.45576 & \textbf{1.00000} \\
+\bottomrule
+\end{tabular}
+\caption{\texttt{hlabelprompt} results.}
+\label{tab:hlabel}
+\end{table}
+
+Under the cleaner \texttt{hlabelprompt} condition, \texttt{setllm} is the strongest model. It achieves the highest accuracy while preserving perfect invariance. Corrected \texttt{setcausal} also reaches perfect swap consistency, but its raw accuracy is weaker. Removing explicit label-order instructions eliminates an old prompt shortcut, so the comparison is cleaner than earlier runs. Even under that cleaner setting, however, \texttt{setcausal} remains worse after 1,000 optimization steps.
+
+\subsection{\texttt{answerlabel} Results}
+
+\begin{table}[t]
+\centering
+\small
+\begin{tabular}{lccc}
+\toprule
+Model & Accuracy & Adv. Order Acc. & Swap Consistency \\
+\midrule
+\texttt{vanilla} & \textbf{0.49598} & 0.17962 & 0.35121 \\
+\texttt{setllm} & 0.47721 & 0.47721 & \textbf{1.00000} \\
+\texttt{setcausal} & 0.48257 & 0.48257 & \textbf{1.00000} \\
+\bottomrule
+\end{tabular}
+\caption{\texttt{answerlabel} results.}
+\label{tab:answerlabel}
+\end{table}
+
+The \texttt{answerlabel} condition changes the story. Repeating the label after each response helps corrected \texttt{setcausal} recover accuracy, bringing it much closer to \texttt{setllm}. This is consistent with a label-to-response binding hypothesis: long decoder-style prompts may benefit when the label is redundantly anchored near the associated response. At the same time, the same redundancy slightly hurts \texttt{setllm}. This suggests that prompt design is architecture-dependent rather than universally optimal.
+
+A small reproducibility check on \texttt{answerlabel} compares seed 42 with seed 123. \texttt{vanilla} remains unchanged at 0.49598, \texttt{setllm} moves from 0.47721 to 0.48525, and \texttt{setcausal} moves from 0.48257 to 0.47989. These corrected invariant comparisons are fairly stable across two seeds. The deeper point is that \texttt{vanilla} still has the highest clean accuracy but poor adversarial robustness and much lower consistency, while the two invariant models are now close enough that prompt format may determine the winner.
+
+\section{MT-Bench Early Results and Backbone Constraints}
+
+We also include an early matched MT-Bench comparison. These results are informative but not yet strong enough for a major claim.
+
+\begin{table}[t]
+\centering
+\small
+\begin{tabular}{lccc}
+\toprule
+Arch & Acc. & Swap Consist. & First Pos. Win \\
+\midrule
+\texttt{vanilla} & 0.396 & 0.484 & 0.359 \\
+\texttt{setllm} & 0.390 & 1.000 & 0.515 \\
+\texttt{setcausal} & \textbf{0.417} & \textbf{1.000} & 0.357 \\
+\bottomrule
+\end{tabular}
+\caption{Early matched MT-Bench results.}
+\label{tab:mtbench-early}
+\end{table}
+
+\texttt{setcausal} is the best MT-Bench model on accuracy while preserving full swap consistency, but the absolute accuracy is still low and the 0.417 vs.\ 0.390 gap is too small to support a strong claim. One likely explanation is that Gemma 2B may simply be too weak to act as a reliable LLM judge on MT-Bench. There is also a failure mode for \texttt{setllm}: despite exact invariance, its first-position win rate rises to 0.515, suggesting a slot-1 collapse that must be disentangled from possible hash-label artifacts.
+
+Two practical constraints further limit interpretation. First, Qwen3.5 2B uses a hybrid attention stack with recurrent or convolutional components, making it inherently sequence-order-sensitive and therefore a poor fit for a clean permutation-invariant \texttt{setllm} evaluation. Second, Gemma 7B still required full precision for \texttt{setllm} evaluation and ran out of memory on 48 GB VRAM. As a result, the current empirical picture is constrained not only by prompt design and masking, but also by which backbones can be evaluated faithfully at all.
+
+\section{Discussion}
+
+Taken together, the results support four concrete claims.
+
+First, position bias is real in open-ended pairwise judging. The \texttt{vanilla} judge repeatedly shows a large gap between clean-order accuracy and adversarial-order accuracy, together with low swap consistency. This is already enough to justify pursuing architecture-level fixes.
+
+Second, the set-aware architectures solve the robustness problem much more cleanly. In the final JudgeBench ablations, both \texttt{setllm} and corrected \texttt{setcausal} achieve perfect swap consistency. That result is important because it shows that order robustness can be built into the model itself rather than added as a post-hoc multi-order wrapper.
+
+Third, the accuracy ranking is not settled by architecture alone. \texttt{setllm} is strongest under \texttt{hlabelprompt}, while \texttt{setcausal} improves substantially under \texttt{answerlabel}. This means the most important research tension is no longer whether corrected \texttt{setcausal} can be invariant; it can. The unresolved question is whether its label binding can be improved enough to close the remaining clean-accuracy gap without sacrificing robustness.
+
+Fourth, the evidence does not yet justify an overly strong paper claim. The current results are informative but still too small for scientific conclusions. The appropriate reading is therefore cautious: the work has established a viable set-aware judge pipeline, shown that prompt asymmetry can dominate outcomes, and identified a concrete next step for \texttt{setcausal}.
+
+\section{Conclusion}
+
+The experiments successfully extend Set-LLM-style permutation handling from MCQ robustness to open-ended pairwise judging, and the resulting invariant models eliminate the swap gap on the current JudgeBench ablations. At the same time, the evidence does not support a simple ``\texttt{setcausal} wins'' story. A more disciplined conclusion is that \texttt{setcausal} is conceptually attractive for long responses and can now achieve full invariance with the corrected mask, but \texttt{setllm} remains stronger on the cleanest current JudgeBench prompt. Prompt design is therefore not a side issue; it is a central part of making architecture-level invariance useful in practice.
+
+\newpage
+\appendix
+
+\section{Current Scope and Near-Term Plan}
+
+The current experimental scope is pairwise judging on JudgeBench and MT-Bench, with LoRA training on decoder-only Hugging Face models and remote GPU tracking through W\&B. Natural next steps are stronger matched ablations on MT-Bench and JudgeBench with the corrected \texttt{setcausal} mask, larger backbones, explicit prompt-format sweeps, and broader adversarial attacks such as whitespace, confident preambles, verbosity shifts, and paragraph reorderings.
+
+An appropriate success condition is that a single-pass invariant judge should become competitive with multi-order baselines at lower cost. This target is narrower than universal metric dominance, but it is a coherent and practically meaningful goal for the next stage of the study.
+
+\end{document}

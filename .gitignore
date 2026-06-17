@@ -201,6 +201,26 @@ cython_debug/
 #   you could uncomment the following to ignore the entire vscode folder
 # .vscode/
 
+# macOS metadata
+.DS_Store
+
+# Local experiment outputs
+artifacts/
+logs/
+saved_results/
+
+# Local paper build products
+*.aux
+*.out
+*.toc
+*.lof
+*.lot
+*.fls
+*.fdb_latexmk
+*.synctex.gz
+*.bbl
+*.blg
+
 # Ruff stuff:
 .ruff_cache/
 

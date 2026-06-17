@@ -12,6 +12,22 @@ described in the paper:
 - LoRA finetuning for decoder-only Hugging Face models
 - Permutation-based evaluation for random-order and adversarial-order accuracy
 
+## Paper Reproduction Quick Links
+
+If your goal is to reproduce the retained paper main-table experiments in this
+branch, start here:
+
+- [PAPER_REPRODUCTION.md](PAPER_REPRODUCTION.md)
+- `scripts/prepare_paper_judge_data.sh`
+- `scripts/submit_mtbench_qwen_gemma_main.sh`
+
+This branch intentionally focuses on:
+
+- `Qwen/Qwen2.5-3B-Instruct`
+- `google/gemma-7b`
+- tie-head main system
+- fixed `unanimous_all` calibration protocol
+
 ## Install
 
 ```bash

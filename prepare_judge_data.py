@@ -7,6 +7,7 @@ import argparse
 import json
 import random
 from pathlib import Path
+from typing import Any
 
 from datasets import load_dataset
 
@@ -15,7 +16,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--source",
-        choices=["mt_bench_human", "llmbar_natural", "faireval", "judgebench"],
+        choices=["mt_bench_human", "arena_human_55k", "llmbar_natural", "faireval"],
         default="mt_bench_human",
         help="Source dataset to convert into pairwise judge JSONL.",
     )
@@ -39,14 +40,6 @@ def parse_args() -> argparse.Namespace:
         "--repo-root",
         default=None,
         help="Optional benchmark repo root for sources stored as local JSON files.",
-    )
-    parser.add_argument(
-        "--swap-sides",
-        action="store_true",
-        help=(
-            "Create a swapped benchmark by exchanging response_a and response_b and "
-            "flipping the pairwise label accordingly."
-        ),
     )
     parser.add_argument("--seed", type=int, default=42)
     return parser.parse_args()
@@ -100,6 +93,64 @@ def convert_mt_bench_row(row: dict) -> dict:
     }
 
 
+def parse_jsonish_turns(value: Any) -> list[str]:
+    if isinstance(value, list):
+        return [str(item).strip() for item in value]
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return [""]
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            return [text]
+        if isinstance(parsed, list):
+            return [str(item).strip() for item in parsed]
+        return [str(parsed).strip()]
+    return [str(value).strip()]
+
+
+def render_turn_list(prefix: str, turns: list[str]) -> str:
+    return "\n\n".join(
+        f"{prefix} turn {turn_index}:\n{text}"
+        for turn_index, text in enumerate(turns, start=1)
+    )
+
+
+def label_from_arena_flags(row: dict) -> str:
+    winner_a = int(row["winner_model_a"])
+    winner_b = int(row["winner_model_b"])
+    winner_tie = int(row["winner_tie"])
+    total = winner_a + winner_b + winner_tie
+    if total != 1:
+        raise ValueError(f"Arena row has invalid winner flags: {row}")
+    if winner_a:
+        return "A"
+    if winner_b:
+        return "B"
+    return "Tie"
+
+
+def convert_arena_row(row: dict) -> dict:
+    prompt_turns = parse_jsonish_turns(row["prompt"])
+    response_a_turns = parse_jsonish_turns(row["response_a"])
+    response_b_turns = parse_jsonish_turns(row["response_b"])
+    prompt_text = render_turn_list("User", prompt_turns)
+    return {
+        "prompt": prompt_text,
+        "response_a": render_turn_list("Assistant", response_a_turns),
+        "response_b": render_turn_list("Assistant", response_b_turns),
+        "label": label_from_arena_flags(row),
+        "question_id": f"arena-{row['id']}",
+        "turn": len(prompt_turns),
+        "model_a": row["model_a"],
+        "model_b": row["model_b"],
+        "source": "lmsys/lmsys-arena-human-preference-55k",
+        "source_split": row.get("source_split", "train"),
+        "prompt_key": json.dumps(prompt_turns, ensure_ascii=False),
+    }
+
+
 def write_jsonl(path: Path, rows: list[dict]) -> None:
     with path.open("w") as handle:
         for row in rows:
@@ -120,54 +171,8 @@ def convert_local_pair_row(row: dict, *, source: str, index: int) -> dict:
     }
 
 
-def convert_judgebench_row(row: dict, *, source_file: str, index: int) -> dict:
-    label_value = row["label"].strip()
-    label_map = {
-        "A>B": "A7",
-        "B>A": "A8",
-        "A=B": "Tie",
-        "B=A": "Tie",
-    }
-    if label_value not in label_map:
-        raise ValueError(f"Unsupported JudgeBench label: {label_value}")
-    return {
-        "prompt": row["question"].strip(),
-        "response_a": row["response_A"].strip(),
-        "response_b": row["response_B"].strip(),
-        "label": label_map[label_value],
-        "question_id": f"judgebench-{row['original_id']}",
-        "pair_id": row["pair_id"],
-        "source": f"ScalerLab/JudgeBench/{source_file}",
-        "response_model": row.get("response_model"),
-        "judge_source": row.get("source"),
-        "row_index": index,
-    }
-
-
 def load_local_json_dataset(path: Path) -> list[dict]:
     return json.loads(path.read_text())
-
-
-def swap_pairwise_row(row: dict) -> dict:
-    swapped = dict(row)
-    swapped["response_a"] = row["response_b"]
-    swapped["response_b"] = row["response_a"]
-    label = row["label"]
-    if label == "A":
-        swapped["label"] = "A8"
-    elif label == "B":
-        swapped["label"] = "A7"
-    elif label == "A7":
-        swapped["label"] = "A8"
-    elif label == "A8":
-        swapped["label"] = "A7"
-    else:
-        swapped["label"] = label
-    swapped["question_id"] = f"{row['question_id']}-swapped"
-    if "pair_id" in row:
-        swapped["pair_id"] = f"{row['pair_id']}-swapped"
-    swapped["swapped_sides"] = True
-    return swapped
 
 
 def build_row_split(
@@ -185,29 +190,47 @@ def build_row_split(
 
 def main() -> None:
     args = parse_args()
-    if args.source == "mt_bench_human":
-        dataset = load_dataset("lmsys/mt_bench_human_judgments", split=args.split_name)
-        converted = []
-        question_ids = sorted(set(dataset["question_id"]))
+    if args.source in {"mt_bench_human", "arena_human_55k"}:
+        if args.source == "mt_bench_human":
+            dataset = load_dataset("lmsys/mt_bench_human_judgments", split=args.split_name)
+            converted = []
+            question_ids = sorted(set(dataset["question_id"]))
 
-        rng = random.Random(args.seed)
-        rng.shuffle(question_ids)
-        eval_count = max(1, int(len(question_ids) * args.eval_question_fraction))
-        eval_question_ids = set(question_ids[:eval_count])
+            rng = random.Random(args.seed)
+            rng.shuffle(question_ids)
+            eval_count = max(1, int(len(question_ids) * args.eval_question_fraction))
+            eval_question_ids = set(question_ids[:eval_count])
 
-        train_rows = []
-        eval_rows = []
-        for row in dataset:
-            converted_row = convert_mt_bench_row(dict(row))
-            converted.append(converted_row)
-            target = (
-                eval_rows
-                if converted_row["question_id"] in eval_question_ids
-                else train_rows
-            )
-            target.append(converted_row)
-        num_unique_questions = len(question_ids)
-        num_eval_questions = len(eval_question_ids)
+            train_rows = []
+            eval_rows = []
+            for row in dataset:
+                converted_row = convert_mt_bench_row(dict(row))
+                converted.append(converted_row)
+                target = (
+                    eval_rows
+                    if converted_row["question_id"] in eval_question_ids
+                    else train_rows
+                )
+                target.append(converted_row)
+            num_unique_questions = len(question_ids)
+            num_eval_questions = len(eval_question_ids)
+        else:
+            dataset = load_dataset("lmsys/lmsys-arena-human-preference-55k", split="train")
+            converted = [convert_arena_row(dict(row)) for row in dataset]
+            prompt_keys = sorted({row["prompt_key"] for row in converted})
+            rng = random.Random(args.seed)
+            rng.shuffle(prompt_keys)
+            eval_count = max(1, int(len(prompt_keys) * args.eval_question_fraction))
+            eval_prompt_keys = set(prompt_keys[:eval_count])
+            train_rows = []
+            eval_rows = []
+            for row in converted:
+                target = eval_rows if row["prompt_key"] in eval_prompt_keys else train_rows
+                row = dict(row)
+                row.pop("prompt_key", None)
+                target.append(row)
+            num_unique_questions = len(prompt_keys)
+            num_eval_questions = len(eval_prompt_keys)
     else:
         if args.repo_root is None:
             raise RuntimeError(f"{args.source} requires --repo-root")
@@ -220,69 +243,6 @@ def main() -> None:
                 repo_root / "Dataset" / "Processed" / "FairEval" / "dataset.json"
             )
             source_name = "princeton-nlp/LLMBar/Processed/FairEval"
-        elif args.source == "judgebench":
-            dataset_paths = sorted((repo_root / "data").glob("*.jsonl"))
-            if not dataset_paths:
-                raise RuntimeError(
-                    f"No JudgeBench JSONL files found under {repo_root / 'data'}"
-                )
-            converted = []
-            for dataset_path in dataset_paths:
-                with dataset_path.open() as handle:
-                    for index, line in enumerate(handle):
-                        line = line.strip()
-                        if not line:
-                            continue
-                        converted.append(
-                            convert_judgebench_row(
-                                json.loads(line),
-                                source_file=dataset_path.name,
-                                index=index,
-                            )
-                        )
-            question_ids = sorted({row["question_id"] for row in converted})
-            rng = random.Random(args.seed)
-            rng.shuffle(question_ids)
-            eval_count = max(1, int(len(question_ids) * args.eval_question_fraction))
-            eval_question_ids = set(question_ids[:eval_count])
-            train_rows = [
-                row for row in converted if row["question_id"] not in eval_question_ids
-            ]
-            eval_rows = [
-                row for row in converted if row["question_id"] in eval_question_ids
-            ]
-            if args.swap_sides:
-                train_rows = [swap_pairwise_row(row) for row in train_rows]
-                eval_rows = [swap_pairwise_row(row) for row in eval_rows]
-                converted = train_rows + eval_rows
-            num_unique_questions = len(question_ids)
-            num_eval_questions = len(eval_question_ids)
-            output_dir = Path(args.output_dir)
-            output_dir.mkdir(parents=True, exist_ok=True)
-            train_path = output_dir / "train.jsonl"
-            eval_path = output_dir / "eval.jsonl"
-            stats_path = output_dir / "stats.json"
-
-            write_jsonl(train_path, train_rows)
-            write_jsonl(eval_path, eval_rows)
-
-            stats = {
-                "source": args.source,
-                "split_name": args.split_name,
-                "swap_sides": args.swap_sides,
-                "num_rows": len(converted),
-                "num_train_rows": len(train_rows),
-                "num_eval_rows": len(eval_rows),
-                "num_unique_questions": num_unique_questions,
-                "num_eval_questions": num_eval_questions,
-                "seed": args.seed,
-            }
-            stats_path.write_text(json.dumps(stats, indent=2) + "\n")
-
-            print(json.dumps(stats, indent=2))
-            print(f"train_jsonl={train_path}")
-            print(f"eval_jsonl={eval_path}")
-            return
         else:
             raise RuntimeError(f"Unsupported source: {args.source}")
 
@@ -291,18 +251,12 @@ def main() -> None:
             convert_local_pair_row(row, source=source_name, index=index)
             for index, row in enumerate(raw_rows)
         ]
-        if args.swap_sides:
-            converted = [swap_pairwise_row(row) for row in converted]
         train_rows, eval_rows = build_row_split(
             converted, args.eval_question_fraction, args.seed
         )
         num_unique_questions = len(converted)
         num_eval_questions = len(eval_rows)
 
-    if args.source == "mt_bench_human" and args.swap_sides:
-        train_rows = [swap_pairwise_row(row) for row in train_rows]
-        eval_rows = [swap_pairwise_row(row) for row in eval_rows]
-        converted = train_rows + eval_rows
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     train_path = output_dir / "train.jsonl"
@@ -315,7 +269,6 @@ def main() -> None:
     stats = {
         "source": args.source,
         "split_name": args.split_name,
-        "swap_sides": args.swap_sides,
         "num_rows": len(converted),
         "num_train_rows": len(train_rows),
         "num_eval_rows": len(eval_rows),
